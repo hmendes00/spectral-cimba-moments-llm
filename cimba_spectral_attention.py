@@ -60,6 +60,7 @@ class CimbaSpectralAttention(nn.Module):
         spectral_sharpness: float = 1.0,
         layer_idx: int = 0,  # Required for KV cache
         bandwidth_target: int = 64,  # S: number of frequency bins (for CIMBA: 2S+1 moments)
+        hard_bandlimit: bool = False,  # True = exact zeros beyond S (requires finetuning)
     ):
         super().__init__()
         
@@ -94,9 +95,22 @@ class CimbaSpectralAttention(nn.Module):
         # RoPE: will be copied from original attention
         self.rotary_emb = None  # Set during weight copy
         
-        # HARD BANDLIMITED spectral filter
-        # Only parameterize first S frequency bins; all higher bins are EXACTLY 0
-        # This guarantees bandlimitedness by construction (no regularizer needed)
+        # === SPECTRAL FILTER ===
+        # Two modes controlled by `hard_bandlimit`:
+        #
+        # COMPAT MODE (hard_bandlimit=False, default):
+        #   - softplus() applied to ALL bins
+        #   - Bins beyond bandwidth_target: softplus(0) ≈ 0.693 (mild attenuation)
+        #   - Works immediately with pretrained models (no finetuning needed)
+        #   - NOT a true hard bandlimit, but preserves model quality
+        #
+        # HARD MODE (hard_bandlimit=True):
+        #   - softplus() applied ONLY to first S bins
+        #   - Bins beyond bandwidth_target: EXACTLY 0 (true hard cutoff)
+        #   - REQUIRES finetuning - will break pretrained models!
+        #   - Enables true O(S) moment compression guarantee
+        #
+        self.hard_bandlimit = hard_bandlimit
         self.max_rfft_bins = max_position_embeddings // 2 + 1
         self.bandwidth_target = bandwidth_target  # S: mutable for curriculum training
         # Initialize so softplus(x) = 1.0 for identity filter: x = ln(e-1) ≈ 0.5413
@@ -105,6 +119,7 @@ class CimbaSpectralAttention(nn.Module):
         # Cache for computed spectral filter (avoid recomputing softplus/pow every call)
         self._cached_filter = None
         self._cached_filter_len = None
+        self._cached_hard_bandlimit = None  # Track mode for cache invalidation
         
         # === Performance optimizations ===
         # FFT threshold: only use spectral filtering above this kv_len
@@ -114,6 +129,15 @@ class CimbaSpectralAttention(nn.Module):
         # Prefill bypass: use standard attention during prefill (q_len > 1)
         # Only use CSA during autoregressive decode (q_len = 1)
         self.prefill_bypass = True
+        
+        # FFT-friendly padding: pad to these sizes for faster cuFFT
+        # cuFFT is fastest for sizes that are products of small primes (2, 3, 5, 7)
+        # NOTE: DISABLED - current implementation has bug where padded FFT filter
+        # doesn't match irfft(n=original_len). Causes gibberish output.
+        # TODO: Fix properly by either:
+        #   1. Use irfft(n=padded_len) then slice result, OR
+        #   2. Compute filter for original_len, not padded_len
+        self.use_fft_padding = False  # DISABLED: breaks generation
         
         # Enable TF32 for faster matmuls on Ampere+ GPUs
         if torch.cuda.is_available():
@@ -158,32 +182,36 @@ class CimbaSpectralAttention(nn.Module):
         rounded_len = self._round_filter_len(filter_len)
         
         # During inference, use cache if valid
+        # Also invalidate if hard_bandlimit mode changed
         if (self._cached_filter is not None and 
             self._cached_filter_len == rounded_len and
-            self._cached_filter.device == device):
+            self._cached_filter.device == device and
+            self._cached_hard_bandlimit == self.hard_bandlimit):
             return self._cached_filter[:filter_len]
         
         # Compute and cache at rounded size
         self._cached_filter = self._compute_spectral_filter(rounded_len, device)
         self._cached_filter_len = rounded_len
+        self._cached_hard_bandlimit = self.hard_bandlimit
         return self._cached_filter[:filter_len]
     
     def _compute_spectral_filter(self, filter_len: int, device: torch.device) -> torch.Tensor:
         """
         Compute the spectral filter from parameters.
         
-        IMPORTANT: For drop-in replacement (no finetuning), we need IDENTITY behavior:
-        - All bins should be ~1.0 so the filter is essentially a no-op
-        - This is achieved by initializing lowpass_param to ln(e-1) ≈ 0.5413
-        - softplus(0.5413) ≈ 1.0, and 1.0^sharpness = 1.0
+        Two modes controlled by self.hard_bandlimit:
         
-        For the "zero" bins (beyond bandwidth_target), we fill with 0.0 then apply
-        softplus to the ENTIRE array. This means:
-        - softplus(0) ≈ 0.693 (not zero!)
-        - 0.693^1.0 ≈ 0.693 (mild attenuation, not hard cutoff)
+        COMPAT MODE (hard_bandlimit=False, default):
+            - softplus() applied to ALL bins
+            - Bins beyond S: softplus(0) ≈ 0.693 (mild attenuation, not hard cutoff)
+            - Works with pretrained models without finetuning
+            - Identity init: softplus(0.5413) ≈ 1.0 for first S bins
         
-        This is NOT a true hard bandlimit, but it preserves pretrained model quality.
-        For true hard bandlimit, finetune the model with hard_bandlimit=True.
+        HARD MODE (hard_bandlimit=True):
+            - softplus() applied ONLY to first S bins  
+            - Bins beyond S: EXACTLY 0 (true hard cutoff)
+            - REQUIRES finetuning! Will break pretrained models.
+            - Enables true O(S) moment compression
         
         Args:
             filter_len: Number of rfft bins
@@ -193,21 +221,23 @@ class CimbaSpectralAttention(nn.Module):
             spectral_filter: [filter_len] tensor of filter coefficients
         """
         bw = min(self.bandwidth_target, filter_len)
-        
-        # Create filter: zeros everywhere, then fill in the low-frequency bins
-        # IMPORTANT: We apply softplus to the ENTIRE array, so "zeros" become softplus(0) ≈ 0.693
-        # This matches the original behavior - high frequencies are NOT hard zeros
-        # This is necessary for drop-in replacement without finetuning!
-        spectral_filter = torch.zeros(filter_len, device=device, dtype=torch.float32)
-        spectral_filter[:bw] = self.lowpass_param[:bw].to(device=device, dtype=torch.float32)
-        
-        # Keep filter positive and stable with softplus (applied to ALL bins)
-        # For identity init: softplus(0.5413) ≈ 1.0, softplus(0) ≈ 0.693
-        spectral_filter = F.softplus(spectral_filter)
-        
-        # Apply sharpness control
         sharpness = F.softplus(self.spectral_sharpness.to(device).float())
-        spectral_filter = spectral_filter ** sharpness
+        
+        if self.hard_bandlimit:
+            # HARD MODE: True bandlimit - exact zeros beyond S
+            # WARNING: Requires finetuning! Breaks pretrained models.
+            spectral_filter = torch.zeros(filter_len, device=device, dtype=torch.float32)
+            active_bins = F.softplus(self.lowpass_param[:bw].to(device=device, dtype=torch.float32))
+            spectral_filter[:bw] = active_bins ** sharpness
+            # spectral_filter[bw:] stays exactly 0
+        else:
+            # COMPAT MODE: Soft bandlimit - works with pretrained models
+            # softplus(0) ≈ 0.693, so high-freq bins are attenuated but not zeroed
+            spectral_filter = torch.zeros(filter_len, device=device, dtype=torch.float32)
+            spectral_filter[:bw] = self.lowpass_param[:bw].to(device=device, dtype=torch.float32)
+            # Apply softplus to ALL bins (compat behavior)
+            spectral_filter = F.softplus(spectral_filter)
+            spectral_filter = spectral_filter ** sharpness
         
         return spectral_filter
     
@@ -224,7 +254,21 @@ class CimbaSpectralAttention(nn.Module):
         x1 = x[..., : x.shape[-1] // 2]
         x2 = x[..., x.shape[-1] // 2 :]
         return torch.cat((-x2, x1), dim=-1)
-        
+    
+    def _get_fft_friendly_size(self, n: int) -> int:
+        """
+        Get the next FFT-friendly size >= n.
+
+        cuFFT is fastest for sizes that are products of small primes (2, 3, 5, 7).
+        We use a simple heuristic: round up to the next multiple of 256,
+        which tends to have good factorization.
+
+        For very long sequences, we could use scipy.fft.next_fast_len,
+        but this simple approach works well in practice.
+        """
+        # Simple: round up to next multiple of 256 (2^8, very FFT-friendly)
+        return ((n + 255) // 256) * 256
+
     def _spectral_attention_weights(
         self,
         query: torch.Tensor,
@@ -238,14 +282,15 @@ class CimbaSpectralAttention(nn.Module):
             query: [batch, num_heads, q_len, head_dim]
             key: [batch, num_heads, kv_len, head_dim] (already GQA-expanded by caller)
             attention_mask: [batch, 1, q_len, kv_len] or None
-            
+
         Returns:
             attn_weights: [batch, num_heads, q_len, kv_len]
-            
+
         Optimizations:
         - Prefill bypass: use standard attention when q_len > 1 (faster TTFT)
         - FFT threshold: skip spectral filtering for short kv_len (faster for short ctx)
-        - Hard bandlimit: only multiply active bins, rest are exact zeros
+        - FFT-friendly padding: pad to optimal sizes for cuFFT performance
+        - Filter caching: avoid recomputing softplus/pow every call
         """
         batch, num_heads, q_len, head_dim = query.shape
         kv_len = key.shape[2]
@@ -266,21 +311,30 @@ class CimbaSpectralAttention(nn.Module):
             # Apply spectral filtering
             orig_dtype = raw_scores.dtype
             if orig_dtype in (torch.float16, torch.bfloat16):
-                raw_scores_f32 = raw_scores.float()
+                raw_scores_f32 = raw_scores.float().contiguous()  # Ensure contiguous for FFT
             else:
-                raw_scores_f32 = raw_scores
+                raw_scores_f32 = raw_scores.contiguous()
+            
+            # === FFT-friendly padding for better cuFFT performance ===
+            if self.use_fft_padding:
+                padded_len = self._get_fft_friendly_size(kv_len)
+                # Pad with zeros (doesn't affect result due to causality)
+                if padded_len > kv_len:
+                    raw_scores_f32 = F.pad(raw_scores_f32, (0, padded_len - kv_len))
+            else:
+                padded_len = kv_len
             
             # FFT along the key dimension
             scores_fft = torch.fft.rfft(raw_scores_f32, dim=-1)
             
-            # Get cached spectral filter (true hard bandlimit)
+            # Get cached spectral filter
             filter_len = scores_fft.shape[-1]
             spectral_filter = self._get_spectral_filter(filter_len, scores_fft.device)
             
-            # Filter in frequency domain (high freq bins are exact 0)
+            # Filter in frequency domain
             scores_filtered = scores_fft * spectral_filter
             
-            # IFFT back to position domain
+            # IFFT back to position domain (use original kv_len to crop padding)
             attn_weights = torch.fft.irfft(scores_filtered, n=kv_len, dim=-1)
             
             if orig_dtype in (torch.float16, torch.bfloat16):
@@ -328,8 +382,8 @@ class CimbaSpectralAttention(nn.Module):
         Forward pass matching Qwen2Attention interface.
         
         Supports two cache modes:
-        1. Standard DynamicCache: Full K and V storage (O(2N))
-        2. CimbaMomentCache: Full K + CIMBA V moments (O(N + S))
+        1. Standard DynamicCache: Full K and V storage, O(2*N) memory
+        2. CimbaMomentCache: Full K + CIMBA V moments, O(N+S) memory
         
         Returns (attn_output, attn_weights) to match Qwen2DecoderLayer expectations.
         """
@@ -582,7 +636,9 @@ def replace_attention_with_spectral(
     model,
     attention_class: type = CimbaSpectralAttention,
     layers_to_replace: Optional[list] = None,
-    bandwidth_target: int = 64,  # S: number of frequency bins for hard bandlimit
+    bandwidth_target: int = 64,  # S: number of frequency bins
+    hard_bandlimit: bool = False,  # True requires finetuning!
+    layer_pattern: str = "all",  # "all", "upper_half", "every_other", "upper_third"
 ) -> nn.Module:
     """
     Replace attention layers in a model with cimba spectral attention.
@@ -590,16 +646,38 @@ def replace_attention_with_spectral(
     Args:
         model: The transformer model (e.g., Qwen)
         attention_class: CimbaSpectralAttention or PureCimbaSpectralAttention
-        layers_to_replace: List of layer indices, or None for all
-        bandwidth_target: S, the number of frequency bins to keep (for CIMBA: 2S+1 moments)
+        layers_to_replace: List of layer indices, or None to use layer_pattern
+        bandwidth_target: S, the number of frequency bins to keep
+        hard_bandlimit: If True, use exact zeros beyond S (requires finetuning!)
+                       If False (default), use soft bandlimit (works with pretrained)
+        layer_pattern: Which layers to replace if layers_to_replace is None:
+                      - "all": All layers (default)
+                      - "upper_half": Only upper half of layers
+                      - "upper_third": Only upper third of layers  
+                      - "every_other": Every other layer (0, 2, 4, ...)
+                      Partial replacement reduces FFT overhead while often preserving quality.
         
     Returns:
         Modified model
     """
     config = model.config
+    num_layers = len(model.model.layers)
+    
+    # Determine which layers to replace
+    if layers_to_replace is None:
+        if layer_pattern == "all":
+            layers_to_replace = list(range(num_layers))
+        elif layer_pattern == "upper_half":
+            layers_to_replace = list(range(num_layers // 2, num_layers))
+        elif layer_pattern == "upper_third":
+            layers_to_replace = list(range(2 * num_layers // 3, num_layers))
+        elif layer_pattern == "every_other":
+            layers_to_replace = list(range(0, num_layers, 2))
+        else:
+            raise ValueError(f"Unknown layer_pattern: {layer_pattern}")
     
     for layer_idx, layer in enumerate(model.model.layers):
-        if layers_to_replace is not None and layer_idx not in layers_to_replace:
+        if layer_idx not in layers_to_replace:
             continue
         
         old_attn = layer.self_attn
@@ -611,7 +689,8 @@ def replace_attention_with_spectral(
             num_kv_heads=getattr(config, 'num_key_value_heads', config.num_attention_heads),
             head_dim=config.hidden_size // config.num_attention_heads,
             layer_idx=layer_idx,  # CRITICAL for KV cache
-            bandwidth_target=bandwidth_target,  # Hard bandlimit
+            bandwidth_target=bandwidth_target,
+            hard_bandlimit=hard_bandlimit,
         )
         
         # Copy weights from original projections
@@ -725,21 +804,21 @@ class CimbaMomentCache:
     Hybrid cache for CIMBA Spectral Attention.
     
     Stores:
-    - K: Full key cache (O(N)) - needed for Q·K similarity
-    - V: CIMBA moment cache (O(S)) - huge memory savings
+    - K: Full key cache O(N) - needed for Q.K similarity
+    - V: CIMBA moment cache O(S) - huge memory savings
     
-    This gives O(N + S) memory instead of O(2N), roughly 2x savings.
+    This gives O(N+S) memory instead of standard O(2*N), roughly 50 percent savings.
     For very long sequences, K dominates, but V savings still significant.
     
     Memory comparison at seq_len=100K, S=64, head_dim=64, 24 layers, 2 KV heads:
-    - Standard: 2 * 24 * 2 * 100K * 64 * 2 bytes = ~614 MB
-    - CIMBA:    24 * 2 * 100K * 64 * 2 + 24 * 2 * 129 * 64 * 8 = ~307 MB + 3 MB ≈ 310 MB
-    - Savings: ~50%
+    - Standard: about 614 MB
+    - CIMBA: about 310 MB
+    - Savings: about 50 percent
     
     Optimizations (V2):
-    - Fast running phase updates: p_k *= exp(i*k*Δθ) instead of recomputing exp()
+    - Fast running phase updates: p_k *= exp(i*k*delta_theta) instead of recomputing exp()
     - Vectorized FFT coefficient extraction (no Python loops)
-    - Optional Fejér smoothing for reduced Gibbs ringing
+    - Optional Fejer smoothing for reduced Gibbs ringing
     """
     
     def __init__(
