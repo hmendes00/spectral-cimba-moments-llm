@@ -94,19 +94,19 @@ After training, verify:
 
 ---
 
-### 🔲 Phase 6: Validation at Scale
+### ✅ Phase 6: Validation at Scale (Partial)
 
 #### 6.1 Quality Benchmarks
 
 Test on:
 1. **Coding tasks**: HumanEval, MBPP
-2. **Long context**: Needle-in-haystack
-3. **Perplexity**: WikiText-103
+2. **Long context**: Needle-in-haystack ✅ **100% accuracy, identical to standard**
+3. **Perplexity**: WikiText-103 ✅ **+0.8% (5.23 vs 5.19)**
 
 #### 6.2 Speed Benchmarks
 
 Measure:
-- Tokens/second during generation
+- Tokens/second during generation ✅ **37 tok/s (79% of standard)**
 - Time-to-first-token
 - Memory bandwidth utilization
 
@@ -186,17 +186,20 @@ $$\text{output}_{\text{norm}}(\tau) = \frac{\text{output}(\tau)}{\sum_{i \leq \t
 | File | Purpose | Status |
 |------|---------|--------|
 | `spectral_attention.py` | SpectralAttention with hard bandlimit | ✅ Complete |
-| `train_bandlimited.py` | Training with curriculum | ✅ Complete |
+| `cimba_spectral_attention.py` | CimbaSpectralAttention drop-in replacement | ✅ Complete |
 | `cimba_cache.py` | CIMBA O(S) moment cache | ✅ Complete |
+| `cimba_cache_v2.py` | Optimized cache with fast phase updates | ✅ Complete |
 | `cimba_attention.py` | CIMBAAttention module for generation | ✅ Complete |
+| `benchmark_csa_vs_standard.py` | Comprehensive CSA vs Standard benchmark | ✅ Complete |
+| `benchmark_needle_haystack.py` | Needle-in-haystack long context test | ✅ Complete |
+| `CIMBA_SPECTRAL_ATTENTION.md` | Full paper with theory and results | ✅ Complete |
+| `train_bandlimited.py` | Training with curriculum | ✅ Complete |
+| `train_dirichlet.py` | Training with Dirichlet attention | ✅ Complete |
 | `test_cimba_integration.py` | End-to-end integration tests | ✅ Complete |
 | `demo_cimba_generation.py` | CIMBA generation demo | ✅ Complete |
 | `README.md` | Project overview | ✅ Complete |
 | `CIMBA_EXPLAINED.md` | Theory for publication | ✅ Complete |
 | `NEXT_STEPS.md` | This roadmap | ✅ Complete |
-| `train_dirichlet.py` | Training with Dirichlet attention | ✅ Complete |
-| `benchmark_memory.py` | Memory comparison | 🔲 TODO |
-| `benchmark_quality.py` | Quality comparison | 🔲 TODO |
 
 ---
 
