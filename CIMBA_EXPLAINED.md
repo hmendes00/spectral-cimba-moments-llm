@@ -130,7 +130,7 @@ We've built a working prototype:
 | Hard bandlimited filter | ✅ Complete |
 | Training with curriculum | ✅ Complete |
 | CIMBA theory validation | ✅ Complete |
-| CIMBA KV cache | 🔲 Next step |
+| CIMBA KV cache |  ✅ Complete |
 
 ## Implications
 

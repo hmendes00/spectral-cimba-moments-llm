@@ -70,7 +70,9 @@ class SpectralAttention(nn.Module):
         
         # Spectral-specific parameters
         self.temperature = temperature
-        self.spectral_sharpness = nn.Parameter(torch.tensor(spectral_sharpness))
+        # Initialize so softplus(x) = 1.0 for identity behavior: x = ln(e-1) ≈ 0.5413
+        self._identity_init = math.log(math.e - 1)  # ≈ 0.5413, gives softplus(x)=1.0
+        self.spectral_sharpness = nn.Parameter(torch.tensor(self._identity_init if spectral_sharpness == 1.0 else spectral_sharpness))
         
         # For GQA
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
@@ -94,7 +96,8 @@ class SpectralAttention(nn.Module):
         # This guarantees bandlimitedness by construction (no regularizer needed)
         self.max_rfft_bins = max_position_embeddings // 2 + 1
         self.bandwidth_target = bandwidth_target  # S: mutable for curriculum training
-        self.lowpass_param = nn.Parameter(torch.ones(bandwidth_target))
+        # Initialize so softplus(x) = 1.0 for identity filter: x = ln(e-1) ≈ 0.5413
+        self.lowpass_param = nn.Parameter(torch.full((bandwidth_target,), self._identity_init))
     
     def set_bandwidth(self, new_bandwidth: int):
         """

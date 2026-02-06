@@ -194,7 +194,7 @@ $$\text{output}_{\text{norm}}(\tau) = \frac{\text{output}(\tau)}{\sum_{i \leq \t
 | `README.md` | Project overview | ✅ Complete |
 | `CIMBA_EXPLAINED.md` | Theory for publication | ✅ Complete |
 | `NEXT_STEPS.md` | This roadmap | ✅ Complete |
-| `train_dirichlet.py` | Training with Dirichlet attention | 🔲 TODO |
+| `train_dirichlet.py` | Training with Dirichlet attention | ✅ Complete |
 | `benchmark_memory.py` | Memory comparison | 🔲 TODO |
 | `benchmark_quality.py` | Quality comparison | 🔲 TODO |
 
