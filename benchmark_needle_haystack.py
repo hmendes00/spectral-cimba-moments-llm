@@ -174,6 +174,11 @@ def run_needle_test(
     # Check answer
     exact_match, partial_score = check_answer(response, needle_info["answer"])
     
+    # Clean up to prevent memory accumulation
+    del inputs, outputs
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    
     return {
         "context_length": actual_context_len,
         "depth_percent": depth_percent,
@@ -342,6 +347,8 @@ def main():
         model_cimba = replace_attention_with_spectral(
             model_cimba, bandwidth_target=args.bandwidth
         )
+        # Enable filter caching optimization
+        model_cimba.eval()
         
         results_cimba = run_benchmark(
             model_cimba, tokenizer, context_lengths, depth_percents,

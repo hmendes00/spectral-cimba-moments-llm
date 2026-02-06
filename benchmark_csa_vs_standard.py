@@ -368,6 +368,7 @@ def run_comprehensive_benchmark(args):
         "Qwen/Qwen2.5-0.5B-Instruct",
         torch_dtype=DTYPE,
     ).to(DEVICE)
+    model_standard.eval()  # Ensure eval mode for fair comparison
     
     reset_memory_stats()
     standard_base_memory = get_gpu_memory_mb()
@@ -416,6 +417,9 @@ def run_comprehensive_benchmark(args):
     
     from cimba_spectral_attention import replace_attention_with_spectral
     model_csa = replace_attention_with_spectral(model_csa, bandwidth_target=bandwidth)
+    
+    # IMPORTANT: Put in eval mode to enable filter caching optimization
+    model_csa.eval()
     
     reset_memory_stats()
     csa_base_memory = get_gpu_memory_mb()

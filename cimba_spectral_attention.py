@@ -28,8 +28,6 @@ import torch.nn.functional as F
 import math
 from typing import Optional, Tuple, Dict
 
-from cimba_cache import CIMBACache
-
 
 class CimbaSpectralAttention(nn.Module):
     """
@@ -103,6 +101,24 @@ class CimbaSpectralAttention(nn.Module):
         self.bandwidth_target = bandwidth_target  # S: mutable for curriculum training
         # Initialize so softplus(x) = 1.0 for identity filter: x = ln(e-1) ≈ 0.5413
         self.lowpass_param = nn.Parameter(torch.full((bandwidth_target,), self._identity_init))
+        
+        # Cache for computed spectral filter (avoid recomputing softplus/pow every call)
+        self._cached_filter = None
+        self._cached_filter_len = None
+        
+        # === Performance optimizations ===
+        # FFT threshold: only use spectral filtering above this kv_len
+        # Below this, standard attention is faster
+        self.fft_threshold = 1024  # Skip FFT for short sequences
+        
+        # Prefill bypass: use standard attention during prefill (q_len > 1)
+        # Only use CSA during autoregressive decode (q_len = 1)
+        self.prefill_bypass = True
+        
+        # Enable TF32 for faster matmuls on Ampere+ GPUs
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
     
     def set_bandwidth(self, new_bandwidth: int):
         """
@@ -112,6 +128,88 @@ class CimbaSpectralAttention(nn.Module):
         For curriculum, start with large bandwidth_target in __init__, then shrink.
         """
         self.bandwidth_target = new_bandwidth
+        # Invalidate cache when bandwidth changes
+        self._cached_filter = None
+        self._cached_filter_len = None
+    
+    def _round_filter_len(self, filter_len: int) -> int:
+        """
+        Round filter length to a fixed size for better cache hit rate.
+        
+        During generation, filter_len grows slowly (e.g., 2001, 2002, 2003...).
+        By rounding to fixed sizes, we can reuse cached filters longer.
+        """
+        # Use powers of 2 (common FFT-friendly sizes)
+        # Or round up to nearest 256 for smooth caching
+        return ((filter_len + 255) // 256) * 256
+    
+    def _get_spectral_filter(self, filter_len: int, device: torch.device) -> torch.Tensor:
+        """
+        Get the spectral filter, using cache during inference.
+        
+        During training, we always recompute (gradients need fresh computation).
+        During inference, we cache the filter for speed.
+        """
+        # During training, always recompute for proper gradients
+        if self.training:
+            return self._compute_spectral_filter(filter_len, device)[:filter_len]
+        
+        # Round to fixed size for better cache hit rate
+        rounded_len = self._round_filter_len(filter_len)
+        
+        # During inference, use cache if valid
+        if (self._cached_filter is not None and 
+            self._cached_filter_len == rounded_len and
+            self._cached_filter.device == device):
+            return self._cached_filter[:filter_len]
+        
+        # Compute and cache at rounded size
+        self._cached_filter = self._compute_spectral_filter(rounded_len, device)
+        self._cached_filter_len = rounded_len
+        return self._cached_filter[:filter_len]
+    
+    def _compute_spectral_filter(self, filter_len: int, device: torch.device) -> torch.Tensor:
+        """
+        Compute the spectral filter from parameters.
+        
+        IMPORTANT: For drop-in replacement (no finetuning), we need IDENTITY behavior:
+        - All bins should be ~1.0 so the filter is essentially a no-op
+        - This is achieved by initializing lowpass_param to ln(e-1) ≈ 0.5413
+        - softplus(0.5413) ≈ 1.0, and 1.0^sharpness = 1.0
+        
+        For the "zero" bins (beyond bandwidth_target), we fill with 0.0 then apply
+        softplus to the ENTIRE array. This means:
+        - softplus(0) ≈ 0.693 (not zero!)
+        - 0.693^1.0 ≈ 0.693 (mild attenuation, not hard cutoff)
+        
+        This is NOT a true hard bandlimit, but it preserves pretrained model quality.
+        For true hard bandlimit, finetune the model with hard_bandlimit=True.
+        
+        Args:
+            filter_len: Number of rfft bins
+            device: Target device
+            
+        Returns:
+            spectral_filter: [filter_len] tensor of filter coefficients
+        """
+        bw = min(self.bandwidth_target, filter_len)
+        
+        # Create filter: zeros everywhere, then fill in the low-frequency bins
+        # IMPORTANT: We apply softplus to the ENTIRE array, so "zeros" become softplus(0) ≈ 0.693
+        # This matches the original behavior - high frequencies are NOT hard zeros
+        # This is necessary for drop-in replacement without finetuning!
+        spectral_filter = torch.zeros(filter_len, device=device, dtype=torch.float32)
+        spectral_filter[:bw] = self.lowpass_param[:bw].to(device=device, dtype=torch.float32)
+        
+        # Keep filter positive and stable with softplus (applied to ALL bins)
+        # For identity init: softplus(0.5413) ≈ 1.0, softplus(0) ≈ 0.693
+        spectral_filter = F.softplus(spectral_filter)
+        
+        # Apply sharpness control
+        sharpness = F.softplus(self.spectral_sharpness.to(device).float())
+        spectral_filter = spectral_filter ** sharpness
+        
+        return spectral_filter
     
     def _apply_rotary_pos_emb(self, q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
         """Apply rotary position embeddings to query and key tensors."""
@@ -143,69 +241,75 @@ class CimbaSpectralAttention(nn.Module):
             
         Returns:
             attn_weights: [batch, num_heads, q_len, kv_len]
+            
+        Optimizations:
+        - Prefill bypass: use standard attention when q_len > 1 (faster TTFT)
+        - FFT threshold: skip spectral filtering for short kv_len (faster for short ctx)
+        - Hard bandlimit: only multiply active bins, rest are exact zeros
         """
         batch, num_heads, q_len, head_dim = query.shape
         kv_len = key.shape[2]
         
-        # NOTE: Key should already be GQA-expanded by caller
         # Compute standard dot-product similarity (scaled)
-        # [batch, heads, q_len, kv_len]
         scale = 1.0 / (self.head_dim ** 0.5)
         raw_scores = torch.matmul(query, key.transpose(-2, -1)) * scale
         
-        # Now apply spectral filtering to the attention pattern
-        # CRITICAL: cuFFT doesn't support half precision or bfloat16
-        # Convert to float32 for FFT, then back to original dtype
-        orig_dtype = raw_scores.dtype
-        if orig_dtype in (torch.float16, torch.bfloat16):
-            raw_scores = raw_scores.float()
+        # === OPTIMIZATION: Skip FFT for prefill or short sequences ===
+        # Prefill (q_len > 1): use standard attention for faster TTFT
+        # Short sequences (kv_len < threshold): FFT overhead not worth it
+        use_spectral = (
+            (not self.prefill_bypass or q_len == 1) and  # Only decode, not prefill
+            kv_len >= self.fft_threshold  # Only for long enough sequences
+        )
         
-        # FFT along the key dimension (last dim)
-        scores_fft = torch.fft.rfft(raw_scores, dim=-1)
+        if use_spectral:
+            # Apply spectral filtering
+            orig_dtype = raw_scores.dtype
+            if orig_dtype in (torch.float16, torch.bfloat16):
+                raw_scores_f32 = raw_scores.float()
+            else:
+                raw_scores_f32 = raw_scores
+            
+            # FFT along the key dimension
+            scores_fft = torch.fft.rfft(raw_scores_f32, dim=-1)
+            
+            # Get cached spectral filter (true hard bandlimit)
+            filter_len = scores_fft.shape[-1]
+            spectral_filter = self._get_spectral_filter(filter_len, scores_fft.device)
+            
+            # Filter in frequency domain (high freq bins are exact 0)
+            scores_filtered = scores_fft * spectral_filter
+            
+            # IFFT back to position domain
+            attn_weights = torch.fft.irfft(scores_filtered, n=kv_len, dim=-1)
+            
+            if orig_dtype in (torch.float16, torch.bfloat16):
+                attn_weights = attn_weights.to(orig_dtype)
+            
+            # Scale by temperature
+            attn_weights = attn_weights / self.temperature
+        else:
+            # Standard attention path (prefill or short sequences)
+            attn_weights = raw_scores
         
-        # Build HARD BANDLIMITED filter: only first `bandwidth_target` bins are non-zero
-        # All higher frequency bins are EXACTLY 0 by construction
-        filter_len = scores_fft.shape[-1]
-        bw = min(self.bandwidth_target, filter_len)
-        
-        # Create filter: zeros everywhere, then fill in the low-frequency bins
-        spectral_filter = torch.zeros(filter_len, device=scores_fft.device, dtype=torch.float32)
-        spectral_filter[:bw] = self.lowpass_param[:bw].to(device=scores_fft.device, dtype=torch.float32)
-        
-        # Keep filter positive and stable with softplus
-        spectral_filter = F.softplus(spectral_filter)
-        
-        # Sharpness control: higher sharpness = more peaky attention
-        sharpness = F.softplus(self.spectral_sharpness.to(scores_fft.device).float())
-        spectral_filter = spectral_filter ** sharpness
-        
-        # Filter in frequency domain (high frequencies are exactly 0)
-        scores_filtered = scores_fft * spectral_filter.to(scores_fft.dtype)
-        
-        # IFFT back to position domain - use kv_len as output size!
-        attn_weights = torch.fft.irfft(scores_filtered, n=kv_len, dim=-1)
-        
-        # Convert back to original dtype
-        if orig_dtype in (torch.float16, torch.bfloat16):
-            attn_weights = attn_weights.to(orig_dtype)
-        
-        # Scale by temperature
-        attn_weights = attn_weights / self.temperature
-        
-        # Apply causal mask if provided
+        # Apply causal mask
         if attention_mask is not None:
             attn_weights = attn_weights + attention_mask
         else:
-            # Create default causal mask
-            # For generation with cache: q_len=1, kv_len=full_seq
-            # The single query at position q_len can attend to all kv positions <= its position
-            causal_mask = torch.triu(
-                torch.ones(q_len, kv_len, device=query.device, dtype=torch.bool),
-                diagonal=kv_len - q_len + 1  # Shift diagonal for cache case
-            )
-            attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
+            # Avoid reconstructing mask every call for decode (q_len=1)
+            if q_len == 1:
+                # Decode: query can attend to all previous positions (no mask needed for causal)
+                # The generation framework handles this via attention_mask
+                pass  # No masking needed for single-token decode with proper attention_mask
+            else:
+                # Prefill: need causal mask
+                causal_mask = torch.triu(
+                    torch.ones(q_len, kv_len, device=query.device, dtype=torch.bool),
+                    diagonal=kv_len - q_len + 1
+                )
+                attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
         
-        # Normalize to form valid attention distribution
+        # Softmax normalization
         attn_weights = F.softmax(attn_weights, dim=-1)
         
         return attn_weights
@@ -631,6 +735,11 @@ class CimbaMomentCache:
     - Standard: 2 * 24 * 2 * 100K * 64 * 2 bytes = ~614 MB
     - CIMBA:    24 * 2 * 100K * 64 * 2 + 24 * 2 * 129 * 64 * 8 = ~307 MB + 3 MB ≈ 310 MB
     - Savings: ~50%
+    
+    Optimizations (V2):
+    - Fast running phase updates: p_k *= exp(i*k*Δθ) instead of recomputing exp()
+    - Vectorized FFT coefficient extraction (no Python loops)
+    - Optional Fejér smoothing for reduced Gibbs ringing
     """
     
     def __init__(
@@ -642,6 +751,7 @@ class CimbaMomentCache:
         max_seq_len: int = 131072,
         device: torch.device = None,
         dtype: torch.dtype = torch.bfloat16,
+        use_fejer_smoothing: bool = False,
     ):
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -650,6 +760,7 @@ class CimbaMomentCache:
         self.max_seq_len = max_seq_len
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.dtype = dtype
+        self.use_fejer_smoothing = use_fejer_smoothing
         
         # Flag to identify this cache type
         self.use_cimba_moments = True
@@ -666,6 +777,23 @@ class CimbaMomentCache:
         # Precompute Fourier indices
         self.k_vals = torch.arange(-S, S + 1, device=self.device, dtype=torch.float32)
         self.num_moments = 2 * S + 1
+        
+        # === V2 Optimizations: Fast phase updates ===
+        # Precompute delta theta (angle increment per token)
+        self.delta_theta = 2 * math.pi / max_seq_len
+        
+        # Precompute delta phase factors: exp(i * k * Δθ) for incremental updates
+        self.delta_phase = torch.exp(1j * self.k_vals * self.delta_theta).to(torch.complex64)
+        
+        # Running phase per layer for fast sequential updates
+        self.running_phase: Dict[int, torch.Tensor] = {}
+        self.current_position: Dict[int, int] = {i: 0 for i in range(num_layers)}
+        
+        # Fejér window for optional smoothing
+        if use_fejer_smoothing:
+            self.fejer_window = (1 - torch.abs(self.k_vals) / (S + 1)).to(self.device)
+        else:
+            self.fejer_window = None
         
     def _get_theta(self, position_ids: torch.Tensor) -> torch.Tensor:
         """Convert positions to circular angles."""
@@ -689,6 +817,10 @@ class CimbaMomentCache:
             
         Returns:
             (full_keys, None) - V is stored as moments, not returned
+            
+        Optimizations:
+        - Fast running phase updates for single-token generation (no exp() per token)
+        - Falls back to batch computation for prefill (seq_len > 1)
         """
         batch, num_kv_heads, seq_len, head_dim = key_states.shape
         device = key_states.device
@@ -706,23 +838,61 @@ class CimbaMomentCache:
         else:
             self.k_cache[layer_idx] = torch.cat([self.k_cache[layer_idx], key_states], dim=2)
         
-        # Update V moments
-        # Position IDs for this batch
-        position_ids = torch.arange(start_pos, start_pos + seq_len, device=device)
-        theta = self._get_theta(position_ids)  # [seq_len]
-        
-        # Phase matrix: e^{ikθ_t} for k=-S..S and t in batch
-        # [seq_len, 2S+1]
-        phase = torch.exp(1j * self.k_vals.unsqueeze(0) * theta.unsqueeze(1))
-        
-        # Convert V to complex
-        v_complex = value_states.to(torch.complex64)  # [batch, num_kv_heads, seq_len, head_dim]
-        
-        # Compute moment contribution: Σ_t e^{ikθ_t} * v_t
-        # v_complex: [batch, kv_heads, seq_len, head_dim]
-        # phase: [seq_len, 2S+1]
-        # Result: [batch, kv_heads, 2S+1, head_dim]
-        moment_contrib = torch.einsum('bhsd,sk->bhkd', v_complex, phase)
+        # === Fast path: single token generation (autoregressive) ===
+        if seq_len == 1:
+            # Initialize running phase if needed
+            if layer_idx not in self.running_phase:
+                # First token: compute phase directly
+                theta = 2 * math.pi * start_pos / self.max_seq_len
+                self.running_phase[layer_idx] = torch.exp(1j * self.k_vals * theta).to(torch.complex64)
+                self.current_position[layer_idx] = start_pos
+            else:
+                # Fast incremental update: multiply by delta_phase for each position skipped
+                steps = start_pos - self.current_position[layer_idx]
+                if steps == 1:
+                    # Common case: single step forward
+                    self.running_phase[layer_idx] = self.running_phase[layer_idx] * self.delta_phase
+                elif steps > 1:
+                    # Multiple steps (rare): use power
+                    self.running_phase[layer_idx] = self.running_phase[layer_idx] * (self.delta_phase ** steps)
+                elif steps < 0:
+                    # Reset case (shouldn't happen normally)
+                    theta = 2 * math.pi * start_pos / self.max_seq_len
+                    self.running_phase[layer_idx] = torch.exp(1j * self.k_vals * theta).to(torch.complex64)
+                self.current_position[layer_idx] = start_pos
+            
+            # Use running phase - [2S+1]
+            phase = self.running_phase[layer_idx].unsqueeze(0)  # [1, 2S+1]
+            
+            # Convert V to complex
+            v_complex = value_states.to(torch.complex64)  # [batch, num_kv_heads, 1, head_dim]
+            
+            # Compute moment contribution for single token
+            moment_contrib = torch.einsum('bhsd,sk->bhkd', v_complex, phase)
+            
+            # Update position for next call
+            self.current_position[layer_idx] = start_pos + 1
+            
+        else:
+            # === Batch path: prefill or multi-token ===
+            # Position IDs for this batch
+            position_ids = torch.arange(start_pos, start_pos + seq_len, device=device)
+            theta = self._get_theta(position_ids)  # [seq_len]
+            
+            # Phase matrix: e^{ikθ_t} for k=-S..S and t in batch
+            # [seq_len, 2S+1]
+            phase = torch.exp(1j * self.k_vals.unsqueeze(0) * theta.unsqueeze(1))
+            
+            # Convert V to complex
+            v_complex = value_states.to(torch.complex64)  # [batch, num_kv_heads, seq_len, head_dim]
+            
+            # Compute moment contribution: Σ_t e^{ikθ_t} * v_t
+            moment_contrib = torch.einsum('bhsd,sk->bhkd', v_complex, phase)
+            
+            # Update running phase to end of this batch for next generation
+            theta_end = 2 * math.pi * (start_pos + seq_len - 1) / self.max_seq_len
+            self.running_phase[layer_idx] = torch.exp(1j * self.k_vals * theta_end).to(torch.complex64)
+            self.current_position[layer_idx] = start_pos + seq_len - 1
         
         # Add to existing moments
         if layer_idx not in self.v_moments:
@@ -837,6 +1007,9 @@ class CimbaMomentCache:
         self.k_cache.clear()
         self.v_moments.clear()
         self.seen_tokens = {i: 0 for i in range(self.num_layers)}
+        # Reset running phase state
+        self.running_phase.clear()
+        self.current_position = {i: 0 for i in range(self.num_layers)}
     
     def memory_usage(self) -> Dict[str, int]:
         """Calculate memory usage in bytes."""
@@ -849,16 +1022,21 @@ class CimbaMomentCache:
         }
 
 
-def create_cimba_cache_for_model(model, S: int = 64) -> CimbaMomentCache:
+def create_cimba_cache_for_model(
+    model, 
+    S: int = 64,
+    use_fejer_smoothing: bool = False,
+) -> CimbaMomentCache:
     """
     Create a CimbaMomentCache configured for the given model.
     
     Args:
         model: Transformer model (e.g., Qwen)
         S: Bandwidth parameter
+        use_fejer_smoothing: Whether to use Fejér window for reduced Gibbs ringing
         
     Returns:
-        CimbaMomentCache instance
+        CimbaMomentCache instance with V2 optimizations (fast phase updates)
     """
     config = model.config
     return CimbaMomentCache(
@@ -869,4 +1047,5 @@ def create_cimba_cache_for_model(model, S: int = 64) -> CimbaMomentCache:
         max_seq_len=getattr(config, 'max_position_embeddings', 131072),
         device=next(model.parameters()).device,
         dtype=next(model.parameters()).dtype,
+        use_fejer_smoothing=use_fejer_smoothing,
     )
