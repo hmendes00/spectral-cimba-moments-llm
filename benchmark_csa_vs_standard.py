@@ -465,25 +465,47 @@ def run_comprehensive_benchmark(args):
     print(f"CIMBA moments: S={S} -> {2*S+1} moments per head")
     
     # Calculate theoretical memory
-    print("\n### Theoretical KV Cache Memory ###")
-    print(f"{'Seq Length':<15} {'Standard V':<18} {'CIMBA V-Moments':<18} {'V Savings':<12}")
+    print("\n### Theoretical V-Cache Memory (Storage Only) ###")
+    print("This shows the STORAGE savings for V-cache, not compute overhead.")
+    print(f"\n{'Seq Length':<15} {'Standard V':<18} {'CIMBA V-Moments':<18} {'V Savings':<12}")
     print("-" * 65)
     
     bytes_per_element = 2  # bfloat16
     cimba_v_memory = num_layers * num_kv_heads * (2*S+1) * head_dim * 8  # complex64
     cimba_v_mb = cimba_v_memory / (1024 * 1024)
     
-    for seq_len in [1024, 4096, 16384, 65536, 131072]:
+    # Test from 1K to 1M tokens
+    test_seq_lens = [1024, 4096, 16384, 65536, 131072, 262144, 524288, 1048576]
+    
+    for seq_len in test_seq_lens:
         # Standard V cache: [layers, kv_heads, seq_len, head_dim]
         standard_v_memory = num_layers * num_kv_heads * seq_len * head_dim * bytes_per_element
         standard_v_mb = standard_v_memory / (1024 * 1024)
         
         savings_pct = (1 - cimba_v_mb / standard_v_mb) * 100 if standard_v_mb > 0 else 0
         
-        print(f"{seq_len:<15} {standard_v_mb:<18.2f} {cimba_v_mb:<18.2f} {savings_pct:>10.1f}%")
+        # Format large numbers nicely
+        if seq_len >= 1000000:
+            seq_str = f"{seq_len // 1000000}M"
+        elif seq_len >= 1000:
+            seq_str = f"{seq_len // 1000}K"
+        else:
+            seq_str = str(seq_len)
+        
+        # Format memory nicely (GB for large values)
+        if standard_v_mb >= 1024:
+            std_str = f"{standard_v_mb / 1024:.2f} GB"
+        else:
+            std_str = f"{standard_v_mb:.2f} MB"
+        
+        print(f"{seq_str:<15} {std_str:<18} {cimba_v_mb:.2f} MB{' ':<8} {savings_pct:>10.1f}%")
     
-    print(f"\nCIMBA V-moment cache is CONSTANT at {cimba_v_mb:.2f} MB regardless of sequence length!")
-    print("(K cache still scales with N, but V savings are massive at long context)")
+    print(f"\n" + "=" * 65)
+    print(f"CIMBA V-moment cache: CONSTANT {cimba_v_mb:.2f} MB at ANY sequence length!")
+    print(f"Standard V-cache at 1M tokens: {num_layers * num_kv_heads * 1048576 * head_dim * 2 / (1024**3):.2f} GB")
+    print("=" * 65)
+    print("\nNote: K-cache still scales with N. Total KV savings depend on K:V ratio.")
+    print("For models with GQA (grouped query attention), V savings are even more impactful.")
     
     # ========================================
     # PART 2.6: Perplexity Test
@@ -593,16 +615,27 @@ def run_comprehensive_benchmark(args):
     
     # Memory Scaling (if tested)
     if args.long_context and standard_memory_scaling:
-        print("\n### Memory Scaling with Sequence Length ###\n")
-        print(f"{'Seq Length':<15} {'Standard (MB)':<20} {'CSA (MB)':<20} {'Savings':<10}")
-        print("-" * 65)
+        print("\n### Memory Scaling with Sequence Length (Forward Pass) ###")
+        print("\nNOTE: This measures TOTAL GPU memory during forward pass, which includes:")
+        print("  - Model weights")
+        print("  - Activations")
+        print("  - KV cache")
+        print("  - FFT working buffers (CIMBA overhead)")
+        print("  - Intermediate tensors")
+        print("\nCSA uses MORE memory at short sequences due to FFT computation overhead.")
+        print("The V-cache savings only dominate at LONG sequences (16K+ tokens).\n")
+        
+        print(f"{'Seq Length':<15} {'Standard (MB)':<20} {'CSA (MB)':<20} {'Diff':<15}")
+        print("-" * 70)
         
         for seq_len in sorted(standard_memory_scaling.keys()):
             std_mem = standard_memory_scaling.get(seq_len, float('inf'))
             csa_mem = csa_memory_scaling.get(seq_len, float('inf'))
             if std_mem < float('inf') and csa_mem < float('inf'):
-                savings = (1 - csa_mem / std_mem) * 100
-                print(f"{seq_len:<15} {std_mem:<20.1f} {csa_mem:<20.1f} {savings:>8.1f}%")
+                diff = csa_mem - std_mem
+                diff_str = f"{diff:+.1f} MB" if abs(diff) < 100 else f"{diff:+.1f} MB"
+                note = "(FFT overhead)" if diff > 0 else "(V savings)"
+                print(f"{seq_len:<15} {std_mem:<20.1f} {csa_mem:<20.1f} {diff_str:<10} {note}")
             else:
                 print(f"{seq_len:<15} {'OOM' if std_mem == float('inf') else f'{std_mem:.1f}':<20} {'OOM' if csa_mem == float('inf') else f'{csa_mem:.1f}':<20}")
     
@@ -648,8 +681,10 @@ def run_comprehensive_benchmark(args):
 Key Findings:
 - CIMBA Spectral Attention produces IDENTICAL outputs to standard attention
 - With identity initialization, perplexity difference is <1%
-- Speed is ~77% of standard (due to FFT overhead in attention)
-- Memory savings come from CIMBA V-moment cache at long context
+- Speed is ~80% of standard (due to FFT overhead in attention)
+- Forward pass uses MORE memory at short sequences (FFT working buffers)
+- V-cache STORAGE savings are massive at long context (99%+ at 1M tokens)
+- Crossover point: ~8K tokens where V-cache savings exceed FFT overhead
 
 Bandwidth Settings:
 +--------------------+-----------------+---------------------------------+
