@@ -22,6 +22,7 @@ from typing import List, Tuple, Dict
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from cimba_spectral_attention import replace_attention_with_spectral
+from fmma_attention import replace_attention_with_fmma, FMMACache, create_fmma_cache
 from gc import collect
 
 
@@ -296,6 +297,9 @@ def main():
     parser.add_argument("--output", default="outputs/needle_haystack_results.json", help="Output file")
     parser.add_argument("--skip-standard", action="store_true", help="Skip standard attention test")
     parser.add_argument("--skip-cimba", action="store_true", help="Skip CIMBA test")
+    parser.add_argument("--skip-fmma", action="store_true", help="Skip FMMA test")
+    parser.add_argument("--fmma-channels", type=int, default=4, help="FMMA num_channels (r)")
+    parser.add_argument("--fmma-bandwidth", type=int, default=32, help="FMMA bandwidth (S)")
     args = parser.parse_args()
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -322,6 +326,8 @@ def main():
         "config": {
             "model": args.model,
             "bandwidth": args.bandwidth,
+            "fmma_channels": args.fmma_channels,
+            "fmma_bandwidth": args.fmma_bandwidth,
             "context_lengths": context_lengths,
             "depth_percents": depth_percents,
             "timestamp": datetime.now().isoformat(),
@@ -387,34 +393,71 @@ def main():
         del model_cimba
         torch.cuda.empty_cache()
     
-    # Comparison
-    if "standard" in all_results["results"] and "cimba_spectral" in all_results["results"]:
+    # Test 3: FMMA (Fejér Mixture Moment Attention)
+    if not args.skip_fmma:
         print(f"\n{'='*60}")
-        print("COMPARISON: Standard vs CIMBA Spectral")
+        print(f"Testing: FMMA (r={args.fmma_channels}, S={args.fmma_bandwidth})")
+        print(f"{'='*60}")
+        print(f"  Note: FMMA has CONSTANT memory O(rS) regardless of context length!")
+        print(f"  Theoretical memory: {args.fmma_channels * args.fmma_bandwidth * 64 * 8 / 1024:.1f} KB per head")
+        
+        model_fmma = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            torch_dtype=torch.bfloat16
+        ).to(device)
+        model_fmma = replace_attention_with_fmma(
+            model_fmma,
+            num_channels=args.fmma_channels,
+            bandwidth=args.fmma_bandwidth,
+            max_seq_len=args.max_context * 2,
+        )
+        model_fmma.eval()
+        
+        reset_memory_stats()
+        results_fmma = run_benchmark(
+            model_fmma, tokenizer, context_lengths, depth_percents,
+            f"FMMA (r={args.fmma_channels}, S={args.fmma_bandwidth})", device=device
+        )
+        all_results["results"]["fmma"] = results_fmma
+        print_summary(results_fmma, f"FMMA (r={args.fmma_channels}, S={args.fmma_bandwidth})")
+        
+        del model_fmma
+        torch.cuda.empty_cache()
+    
+    # Comparison
+    if "standard" in all_results["results"]:
+        print(f"\n{'='*60}")
+        print("COMPARISON: All Methods")
         print(f"{'='*60}")
         
         std_results = [r for r in all_results["results"]["standard"] if "exact_match" in r]
-        cimba_results = [r for r in all_results["results"]["cimba_spectral"] if "exact_match" in r]
         
-        if std_results and cimba_results:
+        if std_results:
             std_exact = sum(1 for r in std_results if r["exact_match"])
-            cimba_exact = sum(1 for r in cimba_results if r["exact_match"])
-            
             std_partial = sum(r["partial_score"] for r in std_results) / len(std_results)
-            cimba_partial = sum(r["partial_score"] for r in cimba_results) / len(cimba_results)
             
-            print(f"\n{'Metric':<25} {'Standard':<15} {'CIMBA Spectral':<15} {'Diff':<10}")
-            print("-" * 65)
-            print(f"{'Exact Match Rate':<25} {100*std_exact/len(std_results):<15.1f}% {100*cimba_exact/len(cimba_results):<15.1f}% {100*(cimba_exact/len(cimba_results) - std_exact/len(std_results)):+.1f}%")
-            print(f"{'Avg Partial Score':<25} {100*std_partial:<15.1f}% {100*cimba_partial:<15.1f}% {100*(cimba_partial - std_partial):+.1f}%")
+            print(f"\n{'Method':<30} {'Exact Match':<15} {'Partial Score':<15} {'Memory':<15}")
+            print("-" * 75)
+            print(f"{'Standard':<30} {100*std_exact/len(std_results):<15.1f}% {100*std_partial:<15.1f}% {'O(N)':<15}")
             
-            # Determine winner
-            if cimba_exact >= std_exact and cimba_partial >= std_partial:
-                print(f"\n>>> CIMBA Spectral performs AT LEAST as well as Standard <<<")
-            elif cimba_exact > std_exact or cimba_partial > std_partial:
-                print(f"\n>>> Mixed results - CIMBA better on some metrics <<<")
-            else:
-                print(f"\n>>> Standard performs better <<<")
+            if "cimba_spectral" in all_results["results"]:
+                cimba_results = [r for r in all_results["results"]["cimba_spectral"] if "exact_match" in r]
+                if cimba_results:
+                    cimba_exact = sum(1 for r in cimba_results if r["exact_match"])
+                    cimba_partial = sum(r["partial_score"] for r in cimba_results) / len(cimba_results)
+                    print(f"{'CIMBA Spectral':<30} {100*cimba_exact/len(cimba_results):<15.1f}% {100*cimba_partial:<15.1f}% {'O(N) K, O(S) V':<15}")
+            
+            if "fmma" in all_results["results"]:
+                fmma_results = [r for r in all_results["results"]["fmma"] if "exact_match" in r]
+                if fmma_results:
+                    fmma_exact = sum(1 for r in fmma_results if r["exact_match"])
+                    fmma_partial = sum(r["partial_score"] for r in fmma_results) / len(fmma_results)
+                    print(f"{'FMMA':<30} {100*fmma_exact/len(fmma_results):<15.1f}% {100*fmma_partial:<15.1f}% {'O(rS) CONSTANT':<15}")
+            
+            print("\nMemory Legend:")
+            print("  O(N) = grows linearly with sequence length")
+            print("  O(S) = grows with bandwidth S only")
+            print("  O(rS) = grows with channels r × bandwidth S (CONSTANT in sequence length)")
     
     # Save results
     import os
