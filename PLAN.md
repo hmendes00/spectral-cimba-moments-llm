@@ -1,95 +1,132 @@
-You are my dev AI. Implement “LAST-TOKEN TEACHER FORCING” training for IWM to remove the O(seq_len) prefix-moment tensor blowup, WITHOUT changing the IWM operator used at inference.
+## Task: Fix CIMBA V-cache so it’s actually used, stays **O(S)**, and **does not break pretrained outputs**
 
-Non-negotiable constraints
-1) Inference operator MUST remain identical:
-   - Generation uses forward_with_cache() with incremental O(S) IWMCache updates.
-   - No full KV storage. Memory must remain O(S) per layer/head.
+### Context (do not debate)
 
-2) Training operator must be the same IWM math:
-   - For a chosen query position t, compute:
-       numerator(t) = Σ_{k=-S..S} g_k(t) * e^{-ikθ_t} * M_k(t)
-       denom(t)    = Σ_{k=-S..S} g_k(t) * e^{-ikθ_t} * Z_k(t)
-       y(t)        = numerator(t) / (denom(t) + eps)
-   - Where M_k(t), Z_k(t) are prefix sums over j<=t with padding masked out.
-   - No future leakage. Strict causality.
+* You previously added/rewired **CimbaMomentCache** and started using **Fourier reconstruction** for `attn @ V`, which causes **garbage output** on pretrained models.
+* Before this change, **V bandlimiting / moment sketching “worked” in practice** (quality + benchmarks), even if cache plumbing wasn’t HF-native.
+* **Goal now**: restore the previous working behavior **while making the cache real and HF-compatible**, and make **V memory constant O(S)** during generation.
 
-What to change
-A) Add a new training path in iwm_attention.py:
-   Implement method:
-     forward_train_last_token(
-        hidden_states,
-        attention_mask,
-        position_embeddings,
-        ...
-     ) -> attn_output_last: Tensor[B, Q_heads, 1, head_dim]
-   or directly return projected output tensor matching the layer output for one position.
+### Non-negotiable goals
 
-   This method must:
-   1) Determine last valid position per sample:
-      - last_idx[b] = max index where attention_mask[b, idx] == 1
-      - batch can have different last_idx.
-   2) Compute per-sample prefix moments ONLY up to last_idx[b], without creating
-      tensors shaped [B, heads, seq_len, 2S+1, head_dim].
-      - Do a streaming scan over tokens j from 0..max_last
-      - Maintain running M_k and Z_k per sample, per kv_head:
-          M_k: [B, kv_heads, 2S+1, head_dim] complex (or 2-float real/imag)
-          Z_k: [B, kv_heads, 2S+1] complex
-      - For samples where j > last_idx[b], do NOT update (mask out).
-      - Also mask out padding tokens via attention_mask.
-   3) At the end, compute y_last for each sample using θ_t where t=last_idx[b]:
-      - Compute g_k(t) from Q_t (content) using coeff_proj.
-      - Use the SAME Fejér smoothing / coefficient construction as current.
-      - Use M_k and Z_k at each sample’s last token to compute y_last.
-   4) Return an output shaped like the normal attention output for that token only
-      so the layer can continue forward:
-        attn_out_last: [B, 1, hidden_size] (after combining heads + o_proj)
-      Then in the transformer layer forward, we will “scatter” this into the sequence.
+1. **Pretrained correctness gate**: With the default settings, generation must match the pretrained baseline behavior (no gibberish).
+2. **CIMBA cache is actually used**: during `model.generate()`, each layer should use the CIMBA cache path without requiring hacks.
+3. **V memory is O(S)**: **do not store full `V`** in the cache when `use_cimba_moments=True` (except in explicit debug mode).
+4. **Keep K cache standard (O(N))**: we are only fixing V now.
 
-B) Integrate into the attention forward() cleanly:
-   - Add a flag on the module: self.training_last_token_only = True (default True for training script).
-   - If self.training and training_last_token_only:
-       - Compute output only for last tokens with forward_train_last_token()
-       - Construct a full output tensor:
-            out = zeros_like(hidden_states)   # [B, L, hidden_size]
-            out[b, last_idx[b], :] = attn_out_last[b, 0, :]
-       - Return out (so the residual/MLP path works unchanged).
-   - IMPORTANT: We are intentionally only supervising last-token logits, so producing zeros elsewhere is fine,
-     BUT do not break shapes.
+---
 
-C) Modify train_iwm_scaled.py to compute loss only on last token:
-   - In collate/tokenize, labels already include -100 for pads.
-   - Compute last_idx[b] as above.
-   - Create labels_last = -100 everywhere except last_idx:
-       labels_last[b, last_idx[b]] = labels[b, last_idx[b]]
-   - Compute CE loss with labels_last.
-   - Keep PSD loss term as-is (but it will now be cheaper too).
-   - Result: backward only flows through last token per sample, making training fast.
+## What to implement
 
-D) Add 2 acceptance tests (must pass)
-1) test_train_last_token_matches_full_for_single_position.py
-   - Build a tiny random batch with no padding and small L (e.g., L=32).
-   - Compute y_last two ways:
-       (a) old full prefix-moment path (existing debug function that can compute all positions)
-       (b) new forward_train_last_token path
-   - Assert max_abs_diff <= 1e-5.
+### A) Split the cache into two modes (explicit flags)
 
-2) test_no_future_leakage_last_token.py
-   - Create two sequences identical up to last_idx, but differ after last_idx (add extra tokens/padding).
-   - Ensure output at last_idx is identical within tolerance.
-   - This proves no future leakage.
+Implement these flags on `CimbaMomentCache`:
 
-E) Logging (so we can see speed win)
-   - Print step time every 50 optimizer steps.
-   - Confirm training iter time drops by at least ~10x vs previous full-seq prefix tensor.
+* `compat_mode=True` (DEFAULT):
 
-Do NOT do these mistakes
-- Do NOT compute full logits and then just pick last token (that doesn’t fix runtime).
-- Do NOT use past_key_values cache for training full sequences (that breaks batching and causality).
-- Do NOT accidentally include future tokens in M_k/Z_k when scanning.
-- Do NOT forget attention_mask when updating moments.
+  * **Outputs MUST be identical to standard attention**
+  * Cache still **updates and stores V moments incrementally**
+  * But **attn_output uses standard V path computed from current `value_states` ONLY**, not from stored full V.
+  * **Do NOT store full V history** (`v_cache_bytes` must remain 0).
 
-Deliverables
-- Updated iwm_attention.py with last-token-only training path.
-- Updated train_iwm_scaled.py to use labels_last loss.
-- Two new test files passing.
-- A short run log showing iteration time improvement.
+* `moment_mode=True` (EXPERIMENTAL, off by default):
+
+  * Uses the moment reconstruction path.
+  * Allowed to be approximate / require finetuning.
+  * Only enabled explicitly by the user.
+
+In other words:
+
+* **compat_mode=True** = “shadow moments” (track moments for constant-memory, but don’t use them to compute outputs yet).
+* **moment_mode=True** = “use moments for output”.
+
+### B) Make V moments truly O(S) without recomputation
+
+Delete/avoid the current approach that:
+
+* stores `self.v_cache[layer]` and
+* recomputes moments from scratch using kv_len-based matrices.
+
+Instead implement **incremental moment updates**:
+
+For each new token value vector `v_t` at absolute position `pos_t`:
+
+* Use a **fixed circle basis** with period `max_seq_len` (or `max_position_embeddings`), not kv_len.
+* Maintain:
+
+  * `V_moments[layer]` shape: `[batch, kv_heads, 2S+1, head_dim]` complex
+* Update:
+
+  * `V_k += exp(+i*k*theta(pos_t)) * v_t`
+  * where `theta(pos) = 2π * pos / max_seq_len`
+
+This avoids storing full V and avoids O(kv_len) recomputation.
+
+### C) In compat_mode, compute output without storing full V
+
+In `CimbaSpectralAttention.forward()`:
+
+* If using the CIMBA cache and `compat_mode=True`:
+
+  * do **not** call any `attend_with_moments()`
+  * do **not** fetch `v_cache`
+  * just do standard attention using the **current full `value` returned by cache.update()**, where `cache.update()` returns the concatenated **value_states for this step only if needed**.
+  * But since we refuse storing full history, you must compute standard attention output using:
+
+    * either the model’s normal DynamicCache for V (ONLY in compat_mode baseline), **or**
+    * the simplest safe route: in compat_mode, **don’t replace V caching at all** (use HF DynamicCache for V), while still building the moment cache side-channel.
+
+**Pick one and implement cleanly:**
+
+* **Recommended**: keep HF’s normal V caching for compat_mode (so exactness holds), while moments are updated in parallel and can later replace V. This keeps output correct and makes your moment cache “real” without quality regression.
+
+### D) Stop mixing bases
+
+Right now the file mixes:
+
+* moments computed with one basis (sometimes `max_seq_len`)
+* coefficients computed with another (sometimes `kv_len` FFT / phase matrices)
+
+For this task:
+
+* **compat_mode path must not depend on coefficient/moment basis at all** (so it stays correct).
+* In moment_mode path (later), use the **same fixed-circle basis** for:
+
+  * moment accumulation
+  * coefficient extraction (if/when you do it)
+
+### E) Add 3 acceptance tests (must pass)
+
+1. **HF generate sanity**:
+
+   * Replace attention with CSA + CimbaMomentCache (compat_mode default).
+   * Generate 256 tokens on a known prompt.
+   * Output must be non-gibberish and similar to baseline (at least not repeating `def ... def ...` with `nodiscard` spam).
+2. **Memory check**:
+
+   * After generating N tokens:
+
+     * `v_cache_bytes == 0` (or constant small debug-only)
+     * `v_moments_bytes` stays constant w.r.t. N
+     * `k_cache_bytes` grows with N (expected)
+3. **Cache usage check**:
+
+   * Ensure the model actually routes into CIMBA cache update for every layer (one log line per layer once per run is enough).
+
+---
+
+## “Don’t do these” (important)
+
+* Do NOT try to “make Fourier reconstruction exact” right now.
+* Do NOT recompute moments from scratch from stored full V.
+* Do NOT change SpectralAttention math again.
+* Do NOT add new operators (Dirichlet-only, IWM-style, etc.) unless asked.
+
+---
+
+## Deliverables
+
+* Update `cimba_spectral_attention.py` with:
+
+  1. A **CimbaMomentCache** that supports “shadow moments” + constant memory for V.
+  2. `compat_mode=True` default path that preserves pretrained outputs.
+  3. The three acceptance tests above.

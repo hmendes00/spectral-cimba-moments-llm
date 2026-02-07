@@ -22,6 +22,7 @@ from typing import List, Tuple, Dict
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from cimba_spectral_attention import replace_attention_with_spectral
+from gc import collect
 
 
 # Filler text for the haystack (technical documentation style)
@@ -265,6 +266,26 @@ def print_summary(results: List[Dict], model_name: str):
         ctx_matches = sum(1 for r in ctx_results if r["exact_match"])
         print(f"  {ctx_len:,}: {ctx_matches}/{len(ctx_results)} ({100*ctx_matches/len(ctx_results):.1f}%)")
 
+def get_gpu_memory_mb() -> float:
+    """Get current GPU memory usage in MB."""
+    if torch.cuda.is_available():
+        return torch.cuda.memory_allocated() / 1024 / 1024
+    return 0.0
+
+
+def get_peak_gpu_memory_mb() -> float:
+    """Get peak GPU memory usage in MB."""
+    if torch.cuda.is_available():
+        return torch.cuda.max_memory_allocated() / 1024 / 1024
+    return 0.0
+
+
+def reset_memory_stats():
+    """Reset GPU memory statistics."""
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
+    collect()
 
 def main():
     parser = argparse.ArgumentParser(description="Needle-in-Haystack Benchmark")
@@ -282,7 +303,7 @@ def main():
     
     # Context lengths to test (exponential scale)
     context_lengths = []
-    ctx = 512
+    ctx = 4096
     while ctx <= args.max_context:
         context_lengths.append(ctx)
         ctx *= 2
@@ -319,10 +340,14 @@ def main():
         
         model_std = AutoModelForCausalLM.from_pretrained(
             args.model,
-            torch_dtype=torch.bfloat16,
-            device_map=device,
-        )
+            torch_dtype=torch.bfloat16
+        ).to(device)
         
+        model_std.eval()  # Ensure eval mode for fair comparison
+
+        reset_memory_stats()
+        csa_base_memory = get_gpu_memory_mb()
+
         results_std = run_benchmark(
             model_std, tokenizer, context_lengths, depth_percents,
             "Standard Attention", device=device
@@ -341,15 +366,17 @@ def main():
         
         model_cimba = AutoModelForCausalLM.from_pretrained(
             args.model,
-            torch_dtype=torch.bfloat16,
-            device_map=device,
-        )
+            torch_dtype=torch.bfloat16
+        ).to(device)
         model_cimba = replace_attention_with_spectral(
             model_cimba, bandwidth_target=args.bandwidth
         )
         # Enable filter caching optimization
         model_cimba.eval()
         
+    
+        reset_memory_stats()
+        csa_base_memory = get_gpu_memory_mb()
         results_cimba = run_benchmark(
             model_cimba, tokenizer, context_lengths, depth_percents,
             f"CIMBA Spectral (S={args.bandwidth})", device=device
