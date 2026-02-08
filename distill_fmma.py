@@ -24,7 +24,7 @@ import os
 import sys
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, List
 from pathlib import Path
 
@@ -43,7 +43,6 @@ import matplotlib.pyplot as plt
 
 from fmma_attention import (
     FMMAAttention,
-    FMMACache,
     replace_attention_with_fmma,
     create_fmma_cache,
     psd_toeplitz_penalty,
@@ -177,125 +176,9 @@ def load_code_dataset(
     except Exception as e:
         print(f"  Warning: Failed to load {dataset_name}: {e}")
         print(f"  Falling back to built-in samples...")
-        samples = FALLBACK_SAMPLES
+        samples = []
     
     return samples
-
-
-# Fallback samples if dataset loading fails
-FALLBACK_SAMPLES = [
-    """# Implement a function to find all prime numbers up to n using the Sieve of Eratosthenes
-def sieve_of_eratosthenes(n):
-    if n < 2:
-        return []
-    is_prime = [True] * (n + 1)
-    is_prime[0] = is_prime[1] = False
-    for i in range(2, int(n**0.5) + 1):
-        if is_prime[i]:
-            for j in range(i*i, n + 1, i):
-                is_prime[j] = False
-    return [i for i in range(n + 1) if is_prime[i]]""",
-    
-    """# Implement merge sort
-def merge_sort(arr):
-    if len(arr) <= 1:
-        return arr
-    mid = len(arr) // 2
-    left = merge_sort(arr[:mid])
-    right = merge_sort(arr[mid:])
-    return merge(left, right)
-
-def merge(left, right):
-    result = []
-    i = j = 0
-    while i < len(left) and j < len(right):
-        if left[i] <= right[j]:
-            result.append(left[i])
-            i += 1
-        else:
-            result.append(right[j])
-            j += 1
-    result.extend(left[i:])
-    result.extend(right[j:])
-    return result""",
-
-    """# Implement a binary search tree
-class TreeNode:
-    def __init__(self, val):
-        self.val = val
-        self.left = None
-        self.right = None
-
-class BST:
-    def __init__(self):
-        self.root = None
-    
-    def insert(self, val):
-        if not self.root:
-            self.root = TreeNode(val)
-            return
-        current = self.root
-        while True:
-            if val < current.val:
-                if current.left is None:
-                    current.left = TreeNode(val)
-                    return
-                current = current.left
-            else:
-                if current.right is None:
-                    current.right = TreeNode(val)
-                    return
-                current = current.right""",
-
-    """# Implement Dijkstra's algorithm
-import heapq
-
-def dijkstra(graph, start):
-    distances = {node: float('infinity') for node in graph}
-    distances[start] = 0
-    pq = [(0, start)]
-    
-    while pq:
-        current_distance, current_node = heapq.heappop(pq)
-        if current_distance > distances[current_node]:
-            continue
-        for neighbor, weight in graph[current_node].items():
-            distance = current_distance + weight
-            if distance < distances[neighbor]:
-                distances[neighbor] = distance
-                heapq.heappush(pq, (distance, neighbor))
-    return distances""",
-
-    """# Implement a trie (prefix tree)
-class TrieNode:
-    def __init__(self):
-        self.children = {}
-        self.is_end = False
-
-class Trie:
-    def __init__(self):
-        self.root = TrieNode()
-    
-    def insert(self, word):
-        node = self.root
-        for char in word:
-            if char not in node.children:
-                node.children[char] = TrieNode()
-            node = node.children[char]
-        node.is_end = True
-    
-    def search(self, word):
-        node = self._find_node(word)
-        return node is not None and node.is_end
-    
-    def _find_node(self, prefix):
-        node = self.root
-        for char in prefix:
-            if char not in node.children:
-                return None
-            node = node.children[char]
-        return node""",
-]
 
 
 class CodingDataset(Dataset):
@@ -517,11 +400,23 @@ def evaluate(student, teacher, eval_loader, config: DistillConfig, max_batches: 
     }
 
 
+def _has_fmma_layers(model) -> bool:
+    """Check whether any layer in the model is an FMMAAttention module."""
+    from fmma.attention import FMMAAttention
+    return any(isinstance(m, FMMAAttention) for m in model.modules())
+
+
 def generate_sample(model, tokenizer, prompt: str, max_new_tokens: int = 100):
-    """Generate a sample completion."""
+    """Generate a sample completion. Uses FMMACache only for FMMA models."""
     model.eval()
     
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    
+    # Only pass an FMMACache when the model actually has FMMA layers.
+    # For the teacher (standard attention), let HF create its own cache.
+    extra_kwargs = {}
+    if _has_fmma_layers(model):
+        extra_kwargs["past_key_values"] = create_fmma_cache(model)
     
     with torch.no_grad():
         outputs = model.generate(
@@ -531,6 +426,7 @@ def generate_sample(model, tokenizer, prompt: str, max_new_tokens: int = 100):
             temperature=0.7,
             top_p=0.9,
             pad_token_id=tokenizer.pad_token_id,
+            **extra_kwargs,
         )
     
     generated = tokenizer.decode(outputs[0], skip_special_tokens=True)

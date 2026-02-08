@@ -387,11 +387,12 @@ class FMMAAttention(nn.Module):
         # p_m(Δ) ≥ 0, so negatives indicate a numerical problem.  We log
         # rather than clamp so training and inference see the *same*
         # operator (no silent distribution shift).
-        with torch.no_grad():
-            chunk_min = densities.min()
-            # Only call .item() outside the training hot path
-            if not torch.is_grad_enabled():
-                chunk_min_val = chunk_min.item()
+        #
+        # Only run the monitoring kernel during eval/generate — during
+        # training the result is never read, so the reduction is wasted work.
+        if not torch.is_grad_enabled():
+            with torch.no_grad():
+                chunk_min_val = densities.min().item()
                 if self._last_min_density is None:
                     self._last_min_density = chunk_min_val
                 else:

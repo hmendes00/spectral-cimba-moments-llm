@@ -12,12 +12,31 @@ from .attention import FMMAAttention
 
 def create_fmma_cache(
     model,
-    num_channels: int = 4,
-    bandwidth: int = 64,
-    max_seq_len: int = 8192,
+    num_channels: int = None,
+    bandwidth: int = None,
+    max_seq_len: int = None,
 ) -> FMMACache:
-    """Create an FMMA cache for a model."""
+    """
+    Create an FMMA cache for a model.
+
+    Auto-detects num_channels, bandwidth, and max_seq_len from the first
+    FMMAAttention layer found in the model.  Explicit overrides take priority.
+    """
     config = model.config
+
+    # Auto-detect FMMA hyperparameters from the model's own layers
+    detected_channels, detected_bw, detected_msl = None, None, None
+    for module in model.modules():
+        if isinstance(module, FMMAAttention):
+            detected_channels = module.num_channels
+            detected_bw = module.bandwidth
+            detected_msl = module.max_seq_len
+            break
+
+    num_channels = num_channels or detected_channels or 4
+    bandwidth = bandwidth or detected_bw or 64
+    max_seq_len = max_seq_len or detected_msl or 8192
+
     return FMMACache(
         num_layers=config.num_hidden_layers,
         num_heads=config.num_attention_heads,
