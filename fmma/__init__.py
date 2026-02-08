@@ -42,6 +42,16 @@ from .integration import (
     _KNOWN_ATTENTION_CLASSES,
 )
 
+# Moment distillation (Softmax → FMMA normalization bridge)
+from .moment_distill import (
+    phases_from_positions,
+    compute_teacher_phase_moments,
+    compute_moment_loss,
+    select_query_indices,
+    select_layers_for_moments,
+    select_heads,
+)
+
 # Tests
 from .tests import run_all_tests
 

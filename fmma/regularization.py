@@ -67,12 +67,26 @@ def psd_toeplitz_penalty(
     else:
         moments_sampled = moments_flat
 
+    # Guard: filter out rows with NaN/Inf (no useful gradient from them)
+    finite_mask = torch.isfinite(moments_sampled.real).all(dim=-1) & \
+                  torch.isfinite(moments_sampled.imag).all(dim=-1)
+    if not finite_mask.any():
+        return torch.tensor(0.0, device=moments.device, requires_grad=True)
+    moments_sampled = moments_sampled[finite_mask]
+
     T = build_toeplitz_matrix(moments_sampled)
+
+    # Guard: check Toeplitz matrix is finite
+    T_real_finite = torch.isfinite(T.real).all()
+    T_imag_finite = torch.isfinite(T.imag).all()
+    if not (T_real_finite and T_imag_finite):
+        return torch.tensor(0.0, device=moments.device, requires_grad=True)
 
     try:
         eigenvalues = torch.linalg.eigvalsh(T)
     except RuntimeError:
-        eigenvalues = torch.linalg.eigvals(T).real
+        # eigvalsh can fail on ill-conditioned matrices; skip penalty
+        return torch.tensor(0.0, device=moments.device, requires_grad=True)
 
     negative_eigs = torch.clamp(eigenvalues, max=0)
     penalty_per_matrix = (negative_eigs ** 2).sum(dim=-1)

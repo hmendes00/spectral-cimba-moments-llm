@@ -89,6 +89,11 @@ class FMMAAttention(nn.Module):
         self._last_min_density: Optional[float] = None
         self._last_query_moments: Optional[torch.Tensor] = None
 
+        # Projected queries stored after forward for lazy moment computation.
+        # distill_fmma.py calls self.query_moments(self._last_queries[:, :, pos])
+        # for the small subset of positions it needs for moment distillation.
+        self._last_queries: Optional[torch.Tensor] = None
+
     # Fix 0.2: Always use max_seq_len for phase mapping (training AND inference)
     def _get_phases(self, position_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -301,10 +306,10 @@ class FMMAAttention(nn.Module):
         chunk_size = min(32, seq_len)
         outputs = []
 
-        # Store moments for regularization — but only subsample to keep memory low
-        # We'll collect from the first chunk only (representative)
-        self._last_query_moments = None
-
+        # ------------------------------------------------------------------
+        # Per-chunk loop.  _training_chunk computes query moments internally
+        # and is wrapped in gradient checkpointing to limit peak memory.
+        # ------------------------------------------------------------------
         for q_start in range(0, seq_len, chunk_size):
             q_end = min(q_start + chunk_size, seq_len)
 
@@ -324,12 +329,31 @@ class FMMAAttention(nn.Module):
                 )
             outputs.append(output_chunk)
 
+        # ------------------------------------------------------------------
+        # Post-loop moment storage (unconditional — no branches!).
+        #
+        # These run AFTER all chunks, outside per-chunk checkpoints.
+        # They are unconditional so that HF’s block-level checkpoint
+        # (which re-runs this entire function) sees the exact same
+        # tensor-creation pattern on every invocation.
+        #
+        # _last_query_moments: first-chunk moments for PSD/BW regularization
+        #   (small: 32 positions × r × (2S+1) complex)
+        # _last_queries: projected Q vectors for distill_fmma.py to call
+        #   query_moments lazily at just the ~16 positions it needs.
+        #   (small: [B, H, T, D] ≈ 3.5 MB for typical configs)
+        # ------------------------------------------------------------------
+        self._last_query_moments = self.query_moments(
+            queries[:, :, :chunk_size]
+        )  # [B, H, chunk, r, 2S+1]
+        self._last_queries = queries  # [B, H, T, D]
+
         return torch.cat(outputs, dim=2).to(dtype)
 
     def _training_chunk(
         self,
         queries: torch.Tensor,      # [B, H, T, D]
-        keys: torch.Tensor,          # [B, H, T, D] (unused here, needed for checkpoint signature)
+        keys: torch.Tensor,          # [B, H, T, D] (unused, kept for signature stability)
         values: torch.Tensor,        # [B, H, T, D]
         key_feats: torch.Tensor,     # [B, H, T, r]
         phases: torch.Tensor,        # [B, T]
@@ -340,23 +364,23 @@ class FMMAAttention(nn.Module):
         q_end: int,
         seq_len: int,
     ) -> torch.Tensor:
-        """Process one query chunk — isolated for gradient checkpointing."""
+        """Process one query chunk — isolated for gradient checkpointing.
+
+        IMPORTANT: This function must be a PURE function with no side-effects
+        (no storing tensors on self).  Moments are computed here per-chunk so
+        that checkpointing can free the FFT intermediates between chunks.
+        """
         batch_size, num_heads = queries.shape[:2]
         device = queries.device
         S = self.bandwidth
 
-        # Compute query moments ONLY for this chunk
+        # Compute query moments for this chunk only
         q_chunk = queries[:, :, q_start:q_end]    # [B, H, chunk, D]
         q_moments_chunk = self.query_moments(q_chunk)  # [B, H, chunk, r, 2S+1]
 
-        # Store moments from first chunk for PSD/bandwidth regularization
-        # Keep gradients attached so penalty losses can backprop
-        if q_start == 0:
-            self._last_query_moments = q_moments_chunk
-
         # Fejér-weight and split into DC + harmonics
         weighted = q_moments_chunk * c_k.view(1, 1, 1, 1, -1)
-        del q_moments_chunk  # free full complex tensor
+        del q_moments_chunk
 
         mu_0_real = weighted[..., S].real              # [B, H, chunk, r]
         mu_pos_real = weighted[..., S + 1:].real       # [B, H, chunk, r, S]
@@ -382,6 +406,12 @@ class FMMAAttention(nn.Module):
         densities = mu_0_real.unsqueeze(3) + 2.0 * (cos_contrib - sin_contrib)
         del cos_contrib, sin_contrib
         # [B, H, chunk, L, r]
+
+        # Clamp densities to prevent float32 overflow.  PSD autocorrelation
+        # guarantees p_m(Δ) ≥ 0 in exact arithmetic, but float32 rounding
+        # with S=128 can produce small negatives.  Clamp at zero (matching
+        # the theoretical guarantee) and cap at a safe maximum.
+        densities = densities.clamp(min=0.0, max=1e4)
 
         # Monitor density nonnegativity.  PSD autocorrelation guarantees
         # p_m(Δ) ≥ 0, so negatives indicate a numerical problem.  We log

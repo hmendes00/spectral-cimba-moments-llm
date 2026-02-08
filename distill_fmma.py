@@ -20,10 +20,12 @@ Per FMMA paper §5.4, training also includes:
 - Bandwidth regularization: penalize high-order moments for smoother densities
 """
 
+import math
 import os
 import sys
 import json
 import time
+import random
 from dataclasses import dataclass
 from typing import Optional, List
 from pathlib import Path
@@ -48,6 +50,14 @@ from fmma_attention import (
     psd_toeplitz_penalty,
     bandwidth_regularization,
 )
+from fmma.moment_distill import (
+    phases_from_positions,
+    compute_teacher_phase_moments,
+    compute_moment_loss,
+    select_query_indices,
+    select_layers_for_moments,
+    select_heads,
+)
 
 
 # ============================================================================
@@ -69,7 +79,7 @@ class DistillConfig:
     # Dataset
     dataset_name: str = "codeparrot/codeparrot-clean-valid"  # HuggingFace dataset
     dataset_split: str = "train"
-    num_samples: int = 5000      # Number of samples to use
+    num_samples: int = 1000      # Number of samples to use
     
     # Training
     learning_rate: float = 5e-4  # Higher LR for FMMA params
@@ -91,6 +101,18 @@ class DistillConfig:
     psd_every: int = 4           # Compute PSD penalty every N steps (eigendecomp is expensive)
     psd_max_samples: int = 64    # Max moment vectors to sample for PSD penalty
     
+    # Moment distillation (Softmax → FMMA normalization bridge, per KL-projection paper)
+    alpha_mom: float = 0.05          # weight for moment loss (start small)
+    alpha_mom_warmup: int = 200      # linearly ramp alpha_mom from 0 over this many steps
+    mom_every: int = 1               # compute moment loss every N steps
+    mom_layers: Optional[List[int]] = None  # None => sample random FMMA layers each step
+    mom_max_layers_per_step: int = 2 # max layers to supervise per step
+    mom_head_stride: int = 2         # use every N-th head
+    mom_query_stride: int = 8        # use every N-th query position
+    mom_max_queries: int = 16        # cap #query positions per batch
+    mom_detach_teacher_attn: bool = True
+    mom_use_fejer_weights: bool = True
+
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     
@@ -353,8 +375,8 @@ def evaluate(student, teacher, eval_loader, config: DistillConfig, max_batches: 
     student.eval()
     teacher.eval()
     
-    total_kl = 0
-    total_ce = 0
+    total_kl = 0.0
+    total_ce = 0.0
     total_tokens = 0
     
     with torch.no_grad():
@@ -378,10 +400,17 @@ def evaluate(student, teacher, eval_loader, config: DistillConfig, max_batches: 
                 input_ids=input_ids,
                 attention_mask=attention_mask,
             )
+
+            # NaN guard: clamp student logits to prevent NaN in loss
+            student_logits = student_outputs.logits
+            if not torch.isfinite(student_logits).all():
+                student_logits = student_logits.nan_to_num(
+                    nan=0.0, posinf=1e4, neginf=-1e4
+                )
             
             # Compute loss
             losses = distillation_loss(
-                student_outputs.logits,
+                student_logits,
                 teacher_outputs.logits,
                 labels,
                 temperature=config.temperature,
@@ -389,11 +418,19 @@ def evaluate(student, teacher, eval_loader, config: DistillConfig, max_batches: 
                 alpha_ce=config.alpha_ce,
             )
             
+            kl_val = losses['kl_loss'].item()
+            ce_val = losses['ce_loss'].item()
             num_tokens = attention_mask.sum().item()
-            total_kl += losses['kl_loss'].item() * num_tokens
-            total_ce += losses['ce_loss'].item() * num_tokens
-            total_tokens += num_tokens
+
+            # Skip NaN batches in accumulation
+            if math.isfinite(kl_val) and math.isfinite(ce_val):
+                total_kl += kl_val * num_tokens
+                total_ce += ce_val * num_tokens
+                total_tokens += num_tokens
     
+    if total_tokens == 0:
+        return {'kl_loss': float('nan'), 'ce_loss': float('nan')}
+
     return {
         'kl_loss': total_kl / total_tokens,
         'ce_loss': total_ce / total_tokens,
@@ -451,11 +488,14 @@ def train(config: DistillConfig):
         tokenizer.pad_token = tokenizer.eos_token
     
     # Load TEACHER (frozen softmax attention) in float16 to save memory
-    print("\nLoading teacher model (standard attention, float16)...")
+    # Must use attn_implementation="eager" so output_attentions=True works
+    # (SDPA/FlashAttention2 silently return None for attentions).
+    print("\nLoading teacher model (standard attention, float16, eager)...")
     teacher = AutoModelForCausalLM.from_pretrained(
         config.model_name,
         dtype=torch.float16,
         trust_remote_code=True,
+        attn_implementation="eager",
     ).to(config.device)
     teacher.eval()
     for param in teacher.parameters():
@@ -479,21 +519,28 @@ def train(config: DistillConfig):
     )
     student = student.to(config.device)
 
-    # Enable gradient checkpointing on FMMA layers (saves ~80% of FFT activation memory)
+    # Enable gradient checkpointing on FMMA layers (frees FFT + density
+    # intermediates between chunks, saving ~80% activation memory).
     for module in student.modules():
         if isinstance(module, FMMAAttention):
             module.gradient_checkpointing = True
 
-    # Also enable HF's own gradient checkpointing for the transformer blocks
+    # Enable HF's gradient checkpointing for the transformer blocks.
+    # _fmma_training_forward is now fully deterministic (no conditional
+    # tensor creation) so nested checkpointing works correctly.
     if hasattr(student, 'gradient_checkpointing_enable'):
         student.gradient_checkpointing_enable()
 
-    # Count parameters
+    # Setup optimizer and scheduler (also freezes non-FMMA params)
+    optimizer = setup_optimizer(student, config)
+
+    # Count parameters (after optimizer setup, which freezes non-FMMA params)
     total_params = sum(p.numel() for p in student.parameters())
     trainable_params = sum(p.numel() for p in student.parameters() if p.requires_grad)
     print(f"\nStudent total parameters: {total_params:,}")
-    print(f"Student trainable parameters: {trainable_params:,}")
-    
+    print(f"Student trainable (FMMA only): {trainable_params:,}")
+    print(f"Student frozen: {total_params - trainable_params:,}")
+
     # Create dataset from HuggingFace
     print("\nPreparing dataset...")
     samples = load_code_dataset(
@@ -511,9 +558,6 @@ def train(config: DistillConfig):
         collate_fn=collate_fn,
     )
     
-    # Setup optimizer and scheduler
-    optimizer = setup_optimizer(student, config)
-    
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=config.warmup_steps,
@@ -524,12 +568,22 @@ def train(config: DistillConfig):
     print(f"\nStarting FMMA distillation for {config.max_steps} steps...")
     print(f"Effective batch size: {config.batch_size * config.gradient_accumulation_steps}")
     print(f"Temperature: {config.temperature}, α_KL={config.alpha_kl}, α_CE={config.alpha_ce}")
+    print(f"Moment distillation: α_mom={config.alpha_mom}, warmup={config.alpha_mom_warmup} steps, every={config.mom_every}")
+
+    # Pre-compute FMMA layer index list for moment distillation subsampling
+    fmma_layer_map = {}  # layer_idx -> module
+    for module in student.modules():
+        if isinstance(module, FMMAAttention):
+            fmma_layer_map[module.layer_idx] = module
+    fmma_layer_indices = sorted(fmma_layer_map.keys())
+    print(f"FMMA layers available for moment supervision: {fmma_layer_indices}")
     
     student.train()
     global_step = 0
-    total_loss = 0.0  # Use float to accumulate detached tensors
-    total_kl = 0.0
-    total_ce = 0.0
+    total_loss = torch.tensor(0.0, device=config.device)  # Keep on GPU to avoid sync
+    total_kl = torch.tensor(0.0, device=config.device)
+    total_ce = torch.tensor(0.0, device=config.device)
+    total_mom = torch.tensor(0.0, device=config.device)
     loss_history = []
     eval_history = []
     
@@ -547,17 +601,68 @@ def train(config: DistillConfig):
             labels = input_ids.clone()
             labels[attention_mask == 0] = -100
             
+            # ================================================================
+            # Moment distillation: decide whether to compute this step
+            # ================================================================
+            do_moment_distill = (
+                config.alpha_mom > 0
+                and global_step % config.mom_every == 0
+                and len(fmma_layer_indices) > 0
+            )
+
+            # ================================================================
             # Teacher forward (no grad) — runs in float16
+            # Request attentions only when moment distillation is active.
+            # ================================================================
             with torch.no_grad():
                 teacher_outputs = teacher(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
+                    output_attentions=do_moment_distill,
+                    return_dict=True,
                 )
             teacher_logits = teacher_outputs.logits.detach().float()
-            # Free teacher output object early
-            del teacher_outputs
 
+            # ================================================================
+            # Moment distillation: set up position-aware moment storage
+            # Before student forward, tell FMMA layers which query positions
+            # to store moments for (PLAN §4).
+            # ================================================================
+            seq_len = input_ids.shape[1]
+            t_idx = None
+            mom_layers_this_step = []
+
+            if do_moment_distill and teacher_outputs.attentions is not None:
+                # Choose query positions and layers to supervise
+                t_idx = select_query_indices(
+                    seq_len, config.mom_query_stride, config.mom_max_queries
+                )
+                mom_layers_this_step = select_layers_for_moments(
+                    fmma_layer_indices,
+                    config.mom_layers,
+                    config.mom_max_layers_per_step,
+                )
+
+            # Hold ONLY the teacher attention layers we actually need (saves VRAM).
+            # Each attention tensor is [B, H, T, T] — keeping all 24 when we only
+            # supervise a few is wasteful.  Detach to drop the teacher graph.
+            teacher_attentions = None
+            if do_moment_distill and teacher_outputs.attentions is not None:
+                needed = set(mom_layers_this_step)
+                teacher_attentions = {
+                    idx: teacher_outputs.attentions[idx].detach()
+                    for idx in needed
+                    if idx < len(teacher_outputs.attentions)
+                }
+            del teacher_outputs
+                # NOTE: we no longer set _store_query_positions on FMMA layers.
+                # Instead, FMMA unconditionally stores _last_all_query_moments
+                # and we index into it here.  This avoids conditional tensor
+                # creation inside the checkpointed forward.
+
+            # ================================================================
             # Student forward
+            # ================================================================
             student_outputs = student(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -573,7 +678,9 @@ def train(config: DistillConfig):
                 alpha_ce=config.alpha_ce,
             )
             
-            # Add FMMA regularization losses (per paper §5.4)
+            # ================================================================
+            # FMMA regularization losses (per paper §5.4)
+            # ================================================================
             psd_loss = torch.tensor(0.0, device=config.device)
             bw_loss = torch.tensor(0.0, device=config.device)
             fmma_count = 0
@@ -584,8 +691,6 @@ def train(config: DistillConfig):
                         moments = module._last_query_moments
                         
                         # PSD Toeplitz penalty: penalize negative eigenvalues
-                        # Eigendecomp is expensive, so we compute it every psd_every steps
-                        # and subsample moment vectors to limit cost
                         if config.alpha_psd > 0 and global_step % config.psd_every == 0:
                             psd_loss = psd_loss + psd_toeplitz_penalty(
                                 moments, reduction='mean', max_samples=config.psd_max_samples
@@ -607,14 +712,116 @@ def train(config: DistillConfig):
                 losses['psd_loss'] = psd_loss
                 losses['bw_loss'] = bw_loss
                 losses['total_loss'] = losses['total_loss'] + config.alpha_psd * psd_loss + config.alpha_bw * bw_loss
-            
+
+            # ================================================================
+            # Moment distillation loss (PLAN §5–6)
+            # ================================================================
+            moment_loss = torch.tensor(0.0, device=config.device)
+
+            if do_moment_distill and teacher_attentions is not None and t_idx is not None:
+                # Determine max_seq_len from any FMMA module
+                fmma_max_seq_len = next(iter(fmma_layer_map.values())).max_seq_len
+                fmma_bandwidth = next(iter(fmma_layer_map.values())).bandwidth
+                fmma_num_heads = next(iter(fmma_layer_map.values())).num_heads
+
+                # Build phases for positions 0..T-1
+                position_ids = torch.arange(seq_len, device=config.device)
+                phases = phases_from_positions(position_ids, fmma_max_seq_len)  # [T]
+                phases = phases.unsqueeze(0).expand(input_ids.shape[0], -1)     # [B, T]
+
+                # Head subsampling
+                h_idx = select_heads(fmma_num_heads, config.mom_head_stride)
+
+                # α_mom warmup schedule (PLAN §10)
+                if config.alpha_mom_warmup > 0 and global_step < config.alpha_mom_warmup:
+                    alpha_mom_eff = config.alpha_mom * (global_step / config.alpha_mom_warmup)
+                else:
+                    alpha_mom_eff = config.alpha_mom
+
+                mom_count = 0
+                for layer_idx in mom_layers_this_step:
+                    module = fmma_layer_map[layer_idx]
+
+                    # Get teacher attention for this layer (dict lookup)
+                    if layer_idx not in teacher_attentions:
+                        continue
+                    teacher_attn = teacher_attentions[layer_idx].float()  # [B, H, T, T]
+
+                    # Compute teacher phase moments
+                    m_teacher = compute_teacher_phase_moments(
+                        attn_weights=teacher_attn,
+                        phases=phases,
+                        t_idx=t_idx,
+                        bandwidth=fmma_bandwidth,
+                        h_idx=h_idx,
+                        use_fejer_weights=config.mom_use_fejer_weights,
+                        detach=config.mom_detach_teacher_attn,
+                    )  # [B, Hsel, Q, 2S+1]
+
+                    # Get student moments at the distillation positions.
+                    # We call query_moments lazily on just the ~16 positions
+                    # needed, keeping memory low.
+                    stored_q = getattr(module, '_last_queries', None)
+                    if stored_q is None:
+                        continue
+                    t_idx_dev = t_idx.to(config.device)
+                    q_subset = stored_q[:, :, t_idx_dev]  # [B, H, Q, D]
+                    mu_student = module.query_moments(q_subset)  # [B, H, Q, r, 2S+1]
+
+                    # Subsample heads from student to match teacher
+                    h_idx_dev = h_idx.to(config.device)
+                    mu_student = mu_student[:, h_idx_dev]  # [B, Hsel, Q, r, 2S+1]
+
+                    # Ensure shapes match
+                    min_q = min(mu_student.shape[2], m_teacher.shape[2])
+                    mu_student = mu_student[:, :, :min_q]
+                    m_teacher = m_teacher[:, :, :min_q]
+
+                    # Compute moment loss
+                    moment_loss = moment_loss + compute_moment_loss(
+                        mu_student=mu_student,
+                        m_teacher=m_teacher,
+                        bandwidth=fmma_bandwidth,
+                        use_fejer_weights=config.mom_use_fejer_weights,
+                    )
+                    mom_count += 1
+
+                    # Clean up stored queries
+                    module._last_queries = None
+
+                if mom_count > 0:
+                    moment_loss = moment_loss / mom_count
+                    losses['moment_loss'] = moment_loss
+                    losses['total_loss'] = losses['total_loss'] + alpha_mom_eff * moment_loss
+
+            # Clean up remaining FMMA modules (in case they weren't selected)
+            for module in student.modules():
+                if isinstance(module, FMMAAttention):
+                    module._last_queries = None
+
+            # Free teacher attentions
+            del teacher_attentions
+
             loss = losses['total_loss'] / config.gradient_accumulation_steps
+
+            # NaN guard: if loss is NaN/Inf, skip this batch entirely.
+            # Don't let NaN gradients poison the model parameters.
+            if not torch.isfinite(loss):
+                if global_step % config.log_every == 0:
+                    print(f"  [step {global_step}] NaN/Inf loss detected — skipping batch")
+                optimizer.zero_grad()
+                global_step += 1
+                pbar.update(1)
+                continue
+
             loss.backward()
             
             # Accumulate without .item() to avoid GPU sync (detach to prevent graph growth)
             total_loss += losses['total_loss'].detach()
             total_kl += losses['kl_loss'].detach()
             total_ce += losses['ce_loss'].detach()
+            if 'moment_loss' in losses:
+                total_mom += losses['moment_loss'].detach()
             
             # Gradient accumulation
             if (global_step + 1) % config.gradient_accumulation_steps == 0:
@@ -647,6 +854,12 @@ def train(config: DistillConfig):
                     "kl": avg_kl,
                     "ce": avg_ce,
                 }
+
+                # Moment distillation loss
+                avg_mom = (total_mom / config.log_every).item()
+                if avg_mom > 0:
+                    log_entry["mom"] = avg_mom
+
                 if min_density is not None:
                     log_entry["min_density"] = min_density
                 loss_history.append(log_entry)
@@ -656,13 +869,16 @@ def train(config: DistillConfig):
                     "kl": f"{avg_kl:.4f}",
                     "ce": f"{avg_ce:.4f}",
                 }
+                if avg_mom > 0:
+                    postfix["mom"] = f"{avg_mom:.4f}"
                 if min_density is not None:
                     postfix["min_d"] = f"{min_density:.3f}"
                 pbar.set_postfix(postfix)
 
-                total_loss = 0.0
-                total_kl = 0.0
-                total_ce = 0.0
+                total_loss = torch.tensor(0.0, device=config.device)
+                total_kl = torch.tensor(0.0, device=config.device)
+                total_ce = torch.tensor(0.0, device=config.device)
+                total_mom = torch.tensor(0.0, device=config.device)
             
             # Evaluation
             if global_step % config.eval_every == 0:
@@ -811,6 +1027,14 @@ if __name__ == "__main__":
     parser.add_argument("--bw-alpha", type=float, default=2.0, help="Exponent for bandwidth regularization")
     parser.add_argument("--psd-every", type=int, default=4, help="Compute PSD penalty every N steps (eigendecomp is expensive)")
     parser.add_argument("--psd-max-samples", type=int, default=64, help="Max moment vectors to sample for PSD penalty")
+    # Moment distillation (Softmax → FMMA normalization bridge)
+    parser.add_argument("--alpha-mom", type=float, default=0.05, help="Weight for moment distillation loss")
+    parser.add_argument("--alpha-mom-warmup", type=int, default=200, help="Steps to linearly ramp alpha_mom from 0")
+    parser.add_argument("--mom-every", type=int, default=1, help="Compute moment loss every N steps")
+    parser.add_argument("--mom-max-layers", type=int, default=2, help="Max FMMA layers to supervise per step")
+    parser.add_argument("--mom-head-stride", type=int, default=2, help="Use every N-th head for moment supervision")
+    parser.add_argument("--mom-query-stride", type=int, default=8, help="Use every N-th query position")
+    parser.add_argument("--mom-max-queries", type=int, default=16, help="Cap number of query positions per batch")
     
     args = parser.parse_args()
     
@@ -831,6 +1055,13 @@ if __name__ == "__main__":
         bw_alpha=args.bw_alpha,
         psd_every=args.psd_every,
         psd_max_samples=args.psd_max_samples,
+        alpha_mom=args.alpha_mom,
+        alpha_mom_warmup=args.alpha_mom_warmup,
+        mom_every=args.mom_every,
+        mom_max_layers_per_step=args.mom_max_layers,
+        mom_head_stride=args.mom_head_stride,
+        mom_query_stride=args.mom_query_stride,
+        mom_max_queries=args.mom_max_queries,
     )
     
     print("="*60)
@@ -840,6 +1071,7 @@ if __name__ == "__main__":
     print(f"Dataset: {config.dataset_name} ({config.num_samples} samples)")
     print(f"FMMA: r={config.num_channels} channels, S={config.bandwidth} bandwidth")
     print(f"Regularization: α_psd={config.alpha_psd}, α_bw={config.alpha_bw}")
+    print(f"Moment distillation: α_mom={config.alpha_mom}, warmup={config.alpha_mom_warmup}")
     print(f"Device: {config.device}")
     print(f"Max steps: {config.max_steps}")
     print(f"Temperature: {config.temperature}")

@@ -110,12 +110,19 @@ class QueryMomentNetwork(nn.Module):
         raw_f = raw_flat.float()
         a = torch.complex(raw_f[..., 0], raw_f[..., 1])  # [N, r, S+1]
 
+        # Normalise `a` before FFT so that |A|² stays O(1).
+        # This prevents float32 overflow with large S (e.g. 128).
+        # The final moments are normalised to μ_0=1 anyway, so
+        # any uniform scaling of `a` cancels out.
+        a_norm = a.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        a = a / a_norm
+
         # Autocorrelation via FFT: μ = IFFT(|FFT(a)|²), normalised so μ_0=1
         n_fft = 2 * S + 1
         A = torch.fft.fft(a, n=n_fft, dim=-1)  # [N, r, 2S+1]
-        power = A.abs().square()                 # |A|²  (fused, avoids separate .real/.imag)
+        power = A.real.square() + A.imag.square()  # |A|² as real tensor
         del A                                    # free immediately
-        autocorr = torch.fft.ifft(power, dim=-1) # [N, r, 2S+1]
+        autocorr = torch.fft.ifft(power.to(torch.complex64), dim=-1) # [N, r, 2S+1]
         del power
 
         # Normalise so μ_0 = 1
