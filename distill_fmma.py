@@ -130,6 +130,13 @@ class DistillConfig:
     # Seed
     seed: int = 42
 
+    # Progressive distillation internals (set by progressive_train, not CLI)
+    # Freeze previously-trained FMMA layers for the first N steps of a new
+    # stage, then unfreeze.  Prevents regression when new flat-init layers
+    # destabilize gradients.
+    _freeze_layers: Optional[List[int]] = None     # layer indices to freeze
+    _unfreeze_after_steps: int = 100                # unfreeze after this many steps
+
 
 # ============================================================================
 # Dataset - Load from HuggingFace
@@ -619,6 +626,20 @@ def train(config: DistillConfig, teacher=None, student=None, tokenizer=None, dat
             fmma_layer_map[module.layer_idx] = module
     fmma_layer_indices = sorted(fmma_layer_map.keys())
     print(f"FMMA layers available for moment supervision: {fmma_layer_indices}")
+
+    # Progressive freeze: temporarily freeze previously-trained FMMA layers
+    # so new flat-init layers can stabilize before everything trains jointly.
+    frozen_params = []
+    if config._freeze_layers:
+        for module in student.modules():
+            if isinstance(module, FMMAAttention) and module.layer_idx in config._freeze_layers:
+                for p in module.parameters():
+                    if p.requires_grad:
+                        p.requires_grad = False
+                        frozen_params.append(p)
+        if frozen_params:
+            print(f"  Temporarily froze {len(frozen_params)} params in layers "
+                  f"{config._freeze_layers} (unfreeze after {config._unfreeze_after_steps} steps)")
     
     student.train()
     global_step = 0
@@ -910,6 +931,20 @@ def train(config: DistillConfig, teacher=None, student=None, tokenizer=None, dat
             
             global_step += 1
             pbar.update(1)
+
+            # Progressive unfreeze: re-enable grads on previously-frozen layers
+            if frozen_params and global_step == config._unfreeze_after_steps:
+                for p in frozen_params:
+                    p.requires_grad = True
+                print(f"\n  Unfroze {len(frozen_params)} params at step {global_step}")
+                # Rebuild optimizer to include the now-unfrozen params
+                optimizer = setup_optimizer(student, config)
+                scheduler = get_linear_schedule_with_warmup(
+                    optimizer,
+                    num_warmup_steps=min(50, (config.max_steps - global_step) // 5),
+                    num_training_steps=config.max_steps - global_step,
+                )
+                frozen_params = []  # clear so we don't re-trigger
             
             # Logging
             if global_step % config.log_every == 0:
@@ -1255,6 +1290,19 @@ def progressive_train(config: DistillConfig, steps_per_stage: Optional[int] = No
         stage_config.max_steps = steps_per_stage
         stage_config.output_dir = str(Path(config.output_dir) / f"stage_{stage_idx}_{stage_name}")
         stage_config.warmup_steps = min(config.warmup_steps, steps_per_stage // 5)
+
+        # Freeze previously-trained FMMA layers for the first N steps of
+        # this stage so new flat-init layers can stabilize without
+        # destabilizing the already-converged ones.
+        if stage_idx > 0 and new_layers:
+            old_layers = sorted(prev_fmma_layers - set(new_layers))
+            if old_layers:
+                stage_config._freeze_layers = old_layers
+                stage_config._unfreeze_after_steps = min(100, steps_per_stage // 5)
+                print(f"  Will freeze layers {old_layers} for first "
+                      f"{stage_config._unfreeze_after_steps} steps")
+        else:
+            stage_config._freeze_layers = None
         
         # Train this stage
         history = train(
