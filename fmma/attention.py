@@ -35,7 +35,8 @@ class FMMAAttention(nn.Module):
       2.3  Padding/attention_mask applied: masked tokens excluded from moments & scores.
       3.2  Linear normalisation with guaranteed ≥0 scores (PSD + nonneg features).
       3.3  Density nonnegativity: PSD autocorrelation hard-enforces nonneg densities.
-           No clamp (train/inference parity). Monitored via _last_min_density.
+           No clamp (train/inference parity, PLAN §1 Policy A). Monitored via
+           _last_min_density.  Strict diagnostic warns if min < -1e-6.
       4.1  Module replacement targets known Qwen/Llama/Mistral attention classes.
       4.2  GQA uses repeat_interleave for correct head mapping.
     """
@@ -87,6 +88,7 @@ class FMMAAttention(nn.Module):
 
         # Diagnostics (not saved, no grad)
         self._last_min_density: Optional[float] = None
+        self._last_min_density_t: Optional[torch.Tensor] = None  # GPU-side, no sync
         self._last_query_moments: Optional[torch.Tensor] = None
 
         # Projected queries stored after forward for lazy moment computation.
@@ -303,7 +305,20 @@ class FMMAAttention(nn.Module):
         c_k = self.fejer_weights.to(device)  # [2S+1]
         k_vals = torch.arange(1, S + 1, device=device, dtype=dtype)
 
-        chunk_size = min(32, seq_len)
+        # Cast values to float ONCE (not per-chunk)
+        values_f = values.float()  # [B, H, T, D]
+
+        # Precompute full causal position indices (reused per chunk)
+        k_positions = torch.arange(seq_len, device=device)
+
+        # Precompute padding mask once (not per chunk)
+        pad_mask = None
+        if attention_mask is not None:
+            pad_mask = (attention_mask == 0).unsqueeze(1).unsqueeze(1)  # [B, 1, 1, T]
+
+        # Larger chunks = fewer loop iterations = fewer kernel launches.
+        # 128 is a good balance: 4 chunks for seq_len=512 vs 16 at chunk=32.
+        chunk_size = min(128, seq_len)
         outputs = []
 
         # ------------------------------------------------------------------
@@ -316,15 +331,15 @@ class FMMAAttention(nn.Module):
             if self.gradient_checkpointing and torch.is_grad_enabled():
                 output_chunk = torch.utils.checkpoint.checkpoint(
                     self._training_chunk,
-                    queries, keys, values, key_feats, phases,
-                    attention_mask, c_k, k_vals,
+                    queries, values_f, key_feats, phases,
+                    pad_mask, c_k, k_vals, k_positions,
                     q_start, q_end, seq_len,
                     use_reentrant=False,
                 )
             else:
                 output_chunk = self._training_chunk(
-                    queries, keys, values, key_feats, phases,
-                    attention_mask, c_k, k_vals,
+                    queries, values_f, key_feats, phases,
+                    pad_mask, c_k, k_vals, k_positions,
                     q_start, q_end, seq_len,
                 )
             outputs.append(output_chunk)
@@ -346,20 +361,23 @@ class FMMAAttention(nn.Module):
         self._last_query_moments = self.query_moments(
             queries[:, :, :chunk_size]
         )  # [B, H, chunk, r, 2S+1]
-        self._last_queries = queries  # [B, H, T, D]
+        # Detach queries: moment distillation re-runs query_moments() on a
+        # small subset, building a fresh graph.  Keeping the full forward-pass
+        # graph alive via _last_queries roughly doubles peak GPU memory.
+        self._last_queries = queries.detach()  # [B, H, T, D]
 
         return torch.cat(outputs, dim=2).to(dtype)
 
     def _training_chunk(
         self,
         queries: torch.Tensor,      # [B, H, T, D]
-        keys: torch.Tensor,          # [B, H, T, D] (unused, kept for signature stability)
-        values: torch.Tensor,        # [B, H, T, D]
-        key_feats: torch.Tensor,     # [B, H, T, r]
-        phases: torch.Tensor,        # [B, T]
-        attention_mask: Optional[torch.Tensor],
-        c_k: torch.Tensor,           # [2S+1]
-        k_vals: torch.Tensor,        # [S]
+        values_f: torch.Tensor,     # [B, H, T, D]  (already float, precomputed)
+        key_feats: torch.Tensor,    # [B, H, T, r]
+        phases: torch.Tensor,       # [B, T]
+        pad_mask: Optional[torch.Tensor],  # [B, 1, 1, T] bool or None (precomputed)
+        c_k: torch.Tensor,          # [2S+1]
+        k_vals: torch.Tensor,       # [S]
+        k_positions: torch.Tensor,  # [T] arange (precomputed)
         q_start: int,
         q_end: int,
         seq_len: int,
@@ -370,7 +388,6 @@ class FMMAAttention(nn.Module):
         (no storing tensors on self).  Moments are computed here per-chunk so
         that checkpointing can free the FFT intermediates between chunks.
         """
-        batch_size, num_heads = queries.shape[:2]
         device = queries.device
         S = self.bandwidth
 
@@ -407,30 +424,25 @@ class FMMAAttention(nn.Module):
         del cos_contrib, sin_contrib
         # [B, H, chunk, L, r]
 
-        # Clamp densities to prevent float32 overflow.  PSD autocorrelation
-        # guarantees p_m(Δ) ≥ 0 in exact arithmetic, but float32 rounding
-        # with S=128 can produce small negatives.  Clamp at zero (matching
-        # the theoretical guarantee) and cap at a safe maximum.
-        densities = densities.clamp(min=0.0, max=1e4)
+        # NO CLAMP (train/inference parity, PLAN.md Fix §1 Policy A).
+        # Track min density on GPU (no sync) for training monitoring;
+        # strict warning only fires outside grad (eval/generate).
+        with torch.no_grad():
+            chunk_min = densities.min()
+            if self._last_min_density_t is None:
+                self._last_min_density_t = chunk_min
+            else:
+                self._last_min_density_t = torch.minimum(self._last_min_density_t, chunk_min)
 
-        # Monitor density nonnegativity.  PSD autocorrelation guarantees
-        # p_m(Δ) ≥ 0, so negatives indicate a numerical problem.  We log
-        # rather than clamp so training and inference see the *same*
-        # operator (no silent distribution shift).
-        #
-        # Only run the monitoring kernel during eval/generate — during
-        # training the result is never read, so the reduction is wasted work.
         if not torch.is_grad_enabled():
             with torch.no_grad():
-                chunk_min_val = densities.min().item()
-                if self._last_min_density is None:
-                    self._last_min_density = chunk_min_val
-                else:
-                    self._last_min_density = min(self._last_min_density, chunk_min_val)
-                if chunk_min_val < -1e-4:
+                chunk_min_val = chunk_min.item()
+                self._last_min_density = chunk_min_val
+                if chunk_min_val < -1e-6:
                     warnings.warn(
                         f"FMMA density went negative (min={chunk_min_val:.2e}). "
-                        f"PSD autocorrelation may have numerical issues."
+                        f"PSD autocorrelation enforcement may have numerical "
+                        f"issues — investigate moment network outputs."
                     )
 
         # Attention scores: Σ_m φ_m(k_i) · p_m(Δ|q)
@@ -438,17 +450,15 @@ class FMMAAttention(nn.Module):
         del densities
         # [B, H, chunk, L]
 
-        # Causal mask
+        # Causal mask — reuse precomputed k_positions
         q_positions = torch.arange(q_start, q_end, device=device)
-        k_positions = torch.arange(seq_len, device=device)
         causal_mask = k_positions.unsqueeze(0) > q_positions.unsqueeze(1)
         attn_scores = attn_scores.masked_fill(
             causal_mask.unsqueeze(0).unsqueeze(0), 0.0
         )
 
-        # Fix 2.3: Apply padding mask
-        if attention_mask is not None:
-            pad_mask = (attention_mask == 0).unsqueeze(1).unsqueeze(1)
+        # Apply precomputed padding mask
+        if pad_mask is not None:
             attn_scores = attn_scores.masked_fill(pad_mask, 0.0)
 
         # Normalise (linear normalisation — valid because scores ≥ 0)
@@ -456,7 +466,7 @@ class FMMAAttention(nn.Module):
             attn_scores.sum(dim=-1, keepdim=True) + 1e-8
         )
 
-        return torch.matmul(attn_weights, values.float())
+        return torch.matmul(attn_weights, values_f)
 
     def _standard_forward(
         self,

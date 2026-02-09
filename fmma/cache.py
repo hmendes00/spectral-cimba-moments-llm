@@ -57,6 +57,11 @@ class FMMACache(DynamicCache):
         k_indices = torch.arange(-bandwidth, bandwidth + 1, dtype=torch.float32)
         self.fejer_weights = 1.0 - torch.abs(k_indices) / (bandwidth + 1)
 
+        # Fix 11 (PLAN.md): Cache k_indices as a persistent tensor instead of
+        # re-allocating every update_moments call (minor speed/memory win for
+        # long generation where update is called once per token).
+        self._cached_k_indices = k_indices  # [2S+1]
+
     def _init_moments(self, layer_idx: int, batch_size: int, device: torch.device):
         """Initialize moment tensors for a layer."""
         self._M_V[layer_idx] = torch.zeros(
@@ -113,13 +118,21 @@ class FMMACache(DynamicCache):
             # Expand for heads and channels
             key_features = key_features * mask.unsqueeze(1).unsqueeze(-1)
 
+        # Mask sanity assertion (PLAN pre-training check):
+        # Verify padded positions contribute zero to moments.
+        if attention_mask is not None and __debug__:
+            pad_positions = (attention_mask == 0)  # [B, T]
+            if pad_positions.any():
+                # key_features already zeroed above; confirm it
+                kf_at_pad = key_features[:, :, pad_positions[0]].abs().sum()
+                assert kf_at_pad == 0, (
+                    f"Mask sanity failed: padded positions have nonzero "
+                    f"key_features (sum={kf_at_pad.item():.2e})"
+                )
+
         # e^{ikθ} for k ∈ {-S, ..., S}
-        k_indices = torch.arange(
-            -self.bandwidth,
-            self.bandwidth + 1,
-            dtype=torch.float32,
-            device=device,
-        )
+        # Fix 11 (PLAN.md): Use cached k_indices instead of allocating anew.
+        k_indices = self._cached_k_indices.to(device=device)
         exp_ik_theta = torch.exp(
             1j * k_indices.view(1, 1, -1) * phases.unsqueeze(-1)
         )  # [B, T, 2S+1]

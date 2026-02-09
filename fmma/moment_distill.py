@@ -174,11 +174,14 @@ def compute_teacher_phase_moments(
     A_q = A[:, :, t_idx_dev, :]  # [B, Hsel, Q, T]
 
     # §8 Sanity: rows should sum to ~1
+    # Use pure-GPU check to avoid .item() sync on every moment-distill step.
     row_sums = A_q.sum(dim=-1)  # [B, Hsel, Q]
-    if (row_sums - 1.0).abs().max() > 0.05:
+    max_dev = (row_sums - 1.0).abs().max()
+    if max_dev > 0.05:
+        # Only call .item() on the rare failure path
         warnings.warn(
             f"Teacher attention rows don't sum to 1 "
-            f"(max deviation: {(row_sums - 1.0).abs().max().item():.4f}). "
+            f"(max deviation: {max_dev.item():.4f}). "
             f"Check attention_mask handling."
         )
 
@@ -212,10 +215,12 @@ def compute_teacher_phase_moments(
     m_teacher = torch.cat([m_neg, m_zero, m_pos], dim=-1)
 
     # §8 Sanity: |m_k| ≤ 1 (moments of a probability measure)
-    max_mag = m_pos.abs().max().item()
+    # Use pure-GPU check to avoid .item() sync on every moment-distill step.
+    max_mag = m_pos.abs().max()
     if max_mag > 1.05:
+        # Only call .item() on the rare failure path
         warnings.warn(
-            f"Teacher moment magnitudes exceed 1 (max={max_mag:.4f}). "
+            f"Teacher moment magnitudes exceed 1 (max={max_mag.item():.4f}). "
             f"This suggests numerical issues."
         )
 

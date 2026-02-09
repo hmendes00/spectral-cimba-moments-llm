@@ -109,15 +109,31 @@ def replace_attention_with_fmma(
         if not (is_known_class or is_structural_match):
             continue
 
-        # Extract layer index
+        # Fix B2 (PLAN.md): Extract layer index safely.
+        # Parse known patterns (e.g. 'model.layers.12.self_attn') instead
+        # of taking the first digit in the path, which can mis-detect if
+        # the path contains other digits.
         layer_idx = None
-        for part in name.split("."):
-            if part.isdigit():
-                layer_idx = int(part)
+        parts = name.split(".")
+        for i, part in enumerate(parts):
+            if part == "layers" and i + 1 < len(parts) and parts[i + 1].isdigit():
+                layer_idx = int(parts[i + 1])
                 break
+        # Fallback: try first digit (for unusual architectures)
+        if layer_idx is None:
+            for part in parts:
+                if part.isdigit():
+                    layer_idx = int(part)
+                    break
 
         if layer_idx is None or layer_idx not in layers_to_replace:
             continue
+
+        # Bounds check
+        assert 0 <= layer_idx < num_layers, (
+            f"Extracted layer_idx={layer_idx} from '{name}' is out of range "
+            f"[0, {num_layers}). Check model architecture."
+        )
 
         device = module.q_proj.weight.device
         dtype = module.q_proj.weight.dtype
@@ -149,6 +165,13 @@ def replace_attention_with_fmma(
             # Original is GQA (fewer KV heads) but FMMA was created with
             # num_kv_heads — this shouldn't happen with new constructor, but
             # handle gracefully.  Fix 4.2: repeat_interleave
+            import warnings as _warnings
+            _warnings.warn(
+                f"Layer {layer_idx}: KV weight shape mismatch "
+                f"(original={k_weight.shape[0]}, FMMA={fmma.k_proj.weight.shape[0]}). "
+                f"Repeating weights via repeat_interleave. This likely indicates "
+                f"a config issue with num_kv_heads."
+            )
             repeat_factor = fmma.k_proj.weight.shape[0] // k_weight.shape[0]
             fmma.k_proj.weight.data.copy_(
                 k_weight.repeat_interleave(repeat_factor, dim=0)

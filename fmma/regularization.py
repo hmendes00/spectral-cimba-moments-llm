@@ -94,7 +94,10 @@ def psd_toeplitz_penalty(
     if reduction == "mean":
         return penalty_per_matrix.mean()
     elif reduction == "sum":
-        scale = N / moments_sampled.shape[0]
+        # Fix C2 (PLAN.md): Scale by the ratio of total to *effective* sample
+        # size (after finite_mask filtering), not the pre-filtered size.
+        effective_samples = moments_sampled.shape[0]
+        scale = N / effective_samples if effective_samples > 0 else 1.0
         return penalty_per_matrix.sum() * scale
     else:
         return penalty_per_matrix
@@ -115,6 +118,10 @@ def bandwidth_regularization(
     """
     device = moments.device
     S = bandwidth
+
+    # Fix C3 (PLAN.md): Guard against S=0 which would cause division by zero.
+    if S == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
 
     k_indices = torch.arange(-S, S + 1, device=device, dtype=torch.float32)
     weights = (torch.abs(k_indices) / S) ** alpha  # [2S+1]

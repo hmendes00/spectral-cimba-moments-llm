@@ -35,6 +35,10 @@ class NonnegativeKeyFeatures(nn.Module):
             features: [batch, num_heads, seq_len, r] nonnegative
         """
         projected = self.projection(keys)
+        # Fix A2 (PLAN.md): Clamp before softplus to prevent exploding features.
+        # Large projections → giant softplus outputs → huge cached moments →
+        # denominator blow-up.  [-20, 20] keeps softplus well-behaved.
+        projected = projected.clamp(-20.0, 20.0)
         return F.softplus(projected, beta=self.beta)
 
 
@@ -92,6 +96,26 @@ class QueryMomentNetwork(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
+        # Fix A6 (PLAN.md): Initialize the final layer to produce near-flat
+        # density for fastest convergence.  With autocorrelation PSD, near-zero
+        # raw outputs → a ≈ [ε, 0, 0, ...] after complex view → μ ≈ δ₀ →
+        # flat Fejér density (near-uniform attention in phase).
+        # This prevents early NaNs and gives the optimizer a benign starting
+        # point close to "attend to everything equally".
+        if enforce_psd:
+            final_layer = self.net[-1]  # last Linear in Sequential
+            nn.init.zeros_(final_layer.weight)
+            if final_layer.bias is not None:
+                # Bias the first coefficient's real part to 1.0 per channel
+                # so a ≈ [1+0j, 0, 0, ...] → μ = δ₀ exactly.
+                nn.init.zeros_(final_layer.bias)
+                with torch.no_grad():
+                    # Each channel's output is (S+1)*2 floats: [re_0, im_0, re_1, im_1, ...]
+                    # Set re_0 = 1.0 for each channel
+                    stride = (bandwidth + 1) * 2  # floats per channel
+                    for m in range(num_channels):
+                        final_layer.bias.data[m * stride] = 1.0
+
     @staticmethod
     def _autocorrelation_psd(raw_flat: torch.Tensor, S: int) -> torch.Tensor:
         """
@@ -124,6 +148,12 @@ class QueryMomentNetwork(nn.Module):
         del A                                    # free immediately
         autocorr = torch.fft.ifft(power.to(torch.complex64), dim=-1) # [N, r, 2S+1]
         del power
+
+        # Fix A4 (PLAN.md): IFFT of a real-valued spectrum yields (nearly)
+        # real autocorrelation, but small imaginary noise can appear.
+        # Force real to prevent rare imaginary drift that later triggers
+        # Hermitian symmetry warnings in the cache path.
+        autocorr = autocorr.real.to(torch.complex64)
 
         # Normalise so μ_0 = 1
         mu_0 = autocorr[..., 0:1].real.clamp(min=1e-8)
