@@ -20,6 +20,8 @@ Per FMMA paper §5.4, training also includes:
 - Bandwidth regularization: penalize high-order moments for smoother densities
 """
 
+import copy
+import glob
 import math
 import os
 import sys
@@ -136,6 +138,9 @@ class DistillConfig:
     # destabilize gradients.
     _freeze_layers: Optional[List[int]] = None     # layer indices to freeze
     _unfreeze_after_steps: int = 100                # unfreeze after this many steps
+
+    # Resume from checkpoint (set via --resume CLI, or programmatically)
+    _resume_from: Optional[str] = None              # path to checkpoint dir (None = train from scratch)
 
 
 # ============================================================================
@@ -508,6 +513,35 @@ def generate_sample(model, tokenizer, prompt: str, max_new_tokens: int = 100):
     return generated
 
 
+def find_latest_checkpoint(output_dir: str, progressive: bool = False) -> Optional[str]:
+    """Find the latest checkpoint in the output directory.
+
+    For single-stage training, looks for ``checkpoint-<step>`` dirs.
+    For progressive training, looks for ``progressive_checkpoint.pt``
+    (the full-state progressive snapshot).
+
+    Returns the path, or None if no checkpoint is found.
+    """
+    output_path = Path(output_dir)
+    if not output_path.exists():
+        return None
+
+    if progressive:
+        prog_ckpt = output_path / "progressive_checkpoint.pt"
+        if prog_ckpt.exists():
+            return str(prog_ckpt)
+        return None
+
+    # Single-stage: find checkpoint-<N> directories, pick highest N
+    ckpt_dirs = sorted(
+        output_path.glob("checkpoint-*"),
+        key=lambda p: int(p.name.split("-")[-1]) if p.name.split("-")[-1].isdigit() else -1,
+    )
+    if ckpt_dirs:
+        return str(ckpt_dirs[-1])
+    return None
+
+
 def train(config: DistillConfig, teacher=None, student=None, tokenizer=None, dataloader=None):
     """Main distillation training loop.
     
@@ -612,7 +646,63 @@ def train(config: DistillConfig, teacher=None, student=None, tokenizer=None, dat
         num_warmup_steps=config.warmup_steps,
         num_training_steps=config.max_steps,
     )
-    
+
+    # ------------------------------------------------------------------
+    # Resume from checkpoint (if requested)
+    # ------------------------------------------------------------------
+    _resumed_step = 0
+    _resumed_loss_history = []
+    _resumed_eval_history = []
+
+    if config._resume_from is not None:
+        resume_path = Path(config._resume_from)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
+
+        print(f"\nResuming from checkpoint: {resume_path}")
+
+        # Load student weights — the checkpoint dir contains HF model files
+        # produced by save_pretrained(), PLUS a training_state.pt with
+        # optimizer/scheduler/step.
+        if (resume_path / "model.safetensors").exists() or (resume_path / "pytorch_model.bin").exists():
+            from safetensors.torch import load_file as load_safetensors
+            if (resume_path / "model.safetensors").exists():
+                state = load_safetensors(str(resume_path / "model.safetensors"))
+            else:
+                state = torch.load(resume_path / "pytorch_model.bin", map_location="cpu")
+            missing, unexpected = student.load_state_dict(state, strict=False)
+            if missing:
+                print(f"  Warning: {len(missing)} missing keys (expected for non-FMMA params)")
+            if unexpected:
+                print(f"  Warning: {len(unexpected)} unexpected keys")
+            del state
+
+        # Restore training state (optimizer, scheduler, step, histories)
+        ts_path = resume_path / "training_state.pt"
+        if ts_path.exists():
+            ts = torch.load(ts_path, map_location="cpu")
+            optimizer.load_state_dict(ts["optimizer"])
+            scheduler.load_state_dict(ts["scheduler"])
+            _resumed_step = ts["global_step"]
+            _resumed_loss_history = ts.get("loss_history", [])
+            _resumed_eval_history = ts.get("eval_history", [])
+            print(f"  Restored optimizer, scheduler, step={_resumed_step}")
+            print(f"  Loss history: {len(_resumed_loss_history)} entries, "
+                  f"Eval history: {len(_resumed_eval_history)} entries")
+            del ts
+        else:
+            # Fallback: only model weights were saved (old-style checkpoint).
+            # Try to infer step from directory name.
+            dirname = resume_path.name
+            if dirname.startswith("checkpoint-") and dirname.split("-")[-1].isdigit():
+                _resumed_step = int(dirname.split("-")[-1])
+                print(f"  No training_state.pt found; inferred step={_resumed_step} from dirname")
+                print(f"  Warning: optimizer/scheduler state NOT restored — LR will reset")
+            else:
+                print(f"  No training_state.pt found and cannot infer step — starting from step 0")
+
+        print(f"  Resuming training from step {_resumed_step}")
+
     # Training loop
     print(f"\nStarting FMMA distillation for {config.max_steps} steps...")
     print(f"Effective batch size: {config.batch_size * config.gradient_accumulation_steps}")
@@ -626,6 +716,18 @@ def train(config: DistillConfig, teacher=None, student=None, tokenizer=None, dat
             fmma_layer_map[module.layer_idx] = module
     fmma_layer_indices = sorted(fmma_layer_map.keys())
     print(f"FMMA layers available for moment supervision: {fmma_layer_indices}")
+
+    # Pre-cache list of FMMA modules (avoids walking student.modules() every step)
+    _all_fmma_modules = [m for m in student.modules() if isinstance(m, FMMAAttention)]
+
+    # Pre-compute head index tensor on device (reused every moment-distill step)
+    _h_idx_dev = None
+    if fmma_layer_indices:
+        _first_fmma = next(iter(fmma_layer_map.values()))
+        _h_idx_dev = select_heads(_first_fmma.num_heads, config.mom_head_stride).to(config.device)
+
+    # Pre-allocate reusable zero tensors for regularization accumulators
+    _zero = torch.tensor(0.0, device=config.device)
 
     # Progressive freeze: temporarily freeze previously-trained FMMA layers
     # so new flat-init layers can stabilize before everything trains jointly.
@@ -642,13 +744,16 @@ def train(config: DistillConfig, teacher=None, student=None, tokenizer=None, dat
                   f"{config._freeze_layers} (unfreeze after {config._unfreeze_after_steps} steps)")
     
     student.train()
-    global_step = 0
+    global_step = _resumed_step
     total_loss = torch.tensor(0.0, device=config.device)  # Keep on GPU to avoid sync
     total_kl = torch.tensor(0.0, device=config.device)
     total_ce = torch.tensor(0.0, device=config.device)
     total_mom = torch.tensor(0.0, device=config.device)
-    loss_history = []
-    eval_history = []
+    loss_history = list(_resumed_loss_history)
+    eval_history = list(_resumed_eval_history)
+    if _resumed_step > 0:
+        print(f"  Continuing from global_step={_resumed_step} "
+              f"({config.max_steps - _resumed_step} steps remaining)")
 
     # Mixed-precision training: bf16 autocast + GradScaler.
     # Runs matmuls/einsums/FFTs in bf16 (~2× faster on Ampere+) while
@@ -757,12 +862,11 @@ def train(config: DistillConfig, teacher=None, student=None, tokenizer=None, dat
             # ================================================================
             # FMMA regularization losses (per paper §5.4)
             # ================================================================
-            psd_loss = torch.tensor(0.0, device=config.device)
-            bw_loss = torch.tensor(0.0, device=config.device)
+            psd_loss = _zero
+            bw_loss = _zero
             fmma_count = 0
             
-            for module in student.modules():
-                if isinstance(module, FMMAAttention):
+            for module in _all_fmma_modules:
                     if hasattr(module, '_last_query_moments') and module._last_query_moments is not None:
                         moments = module._last_query_moments
                         
@@ -792,21 +896,20 @@ def train(config: DistillConfig, teacher=None, student=None, tokenizer=None, dat
             # ================================================================
             # Moment distillation loss (PLAN §5–6)
             # ================================================================
-            moment_loss = torch.tensor(0.0, device=config.device)
+            moment_loss = _zero
 
             if do_moment_distill and teacher_attentions is not None and t_idx is not None:
                 # Determine max_seq_len from any FMMA module
-                fmma_max_seq_len = next(iter(fmma_layer_map.values())).max_seq_len
-                fmma_bandwidth = next(iter(fmma_layer_map.values())).bandwidth
-                fmma_num_heads = next(iter(fmma_layer_map.values())).num_heads
+                fmma_max_seq_len = _first_fmma.max_seq_len
+                fmma_bandwidth = _first_fmma.bandwidth
 
                 # Build phases for positions 0..T-1
                 position_ids = torch.arange(seq_len, device=config.device)
                 phases = phases_from_positions(position_ids, fmma_max_seq_len)  # [T]
                 phases = phases.unsqueeze(0).expand(input_ids.shape[0], -1)     # [B, T]
 
-                # Head subsampling — move indices to device once
-                h_idx = select_heads(fmma_num_heads, config.mom_head_stride).to(config.device)
+                # Use pre-computed head indices (already on device)
+                h_idx = _h_idx_dev
                 t_idx_dev = t_idx.to(config.device)
 
                 # α_mom warmup schedule (PLAN §10)
@@ -876,8 +979,8 @@ def train(config: DistillConfig, teacher=None, student=None, tokenizer=None, dat
                         s_nondc = mu_student[..., :S].abs().mean()  # negative-k half
                         # Teacher: same metric — mean magnitude of non-DC moments
                         t_nondc = m_teacher[..., :S].abs().mean()
-                        s_norm = s_nondc
-                        t_norm = t_nondc
+                        s_norm = s_nondc.detach()
+                        t_norm = t_nondc.detach()
                         if not hasattr(module, '_diag_student_mom_norm'):
                             module._diag_student_mom_norm = s_norm
                             module._diag_teacher_mom_norm = t_norm
@@ -894,9 +997,8 @@ def train(config: DistillConfig, teacher=None, student=None, tokenizer=None, dat
                     losses['total_loss'] = losses['total_loss'] + alpha_mom_eff * moment_loss
 
             # Clean up remaining FMMA modules (in case they weren't selected)
-            for module in student.modules():
-                if isinstance(module, FMMAAttention):
-                    module._last_queries = None
+            for module in _all_fmma_modules:
+                module._last_queries = None
 
             # Free teacher attentions
             del teacher_attentions
@@ -958,9 +1060,7 @@ def train(config: DistillConfig, teacher=None, student=None, tokenizer=None, dat
                 min_density = None
                 student_mom_norm = None
                 teacher_mom_norm = None
-                for module in student.modules():
-                    if not isinstance(module, FMMAAttention):
-                        continue
+                for module in _all_fmma_modules:
                     # Nonnegativity check — GPU tensor, .item() only at log time
                     if module._last_min_density_t is not None:
                         md = module._last_min_density_t.item()
@@ -1042,6 +1142,14 @@ def train(config: DistillConfig, teacher=None, student=None, tokenizer=None, dat
                 checkpoint_path = output_dir / f"checkpoint-{global_step}"
                 student.save_pretrained(checkpoint_path)
                 tokenizer.save_pretrained(checkpoint_path)
+                # Save full training state for resume
+                torch.save({
+                    "global_step": global_step,
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "loss_history": loss_history,
+                    "eval_history": eval_history,
+                }, checkpoint_path / "training_state.pt")
                 print(f"\nSaved checkpoint to {checkpoint_path}")
     
     pbar.close()
@@ -1240,8 +1348,47 @@ def progressive_train(config: DistillConfig, steps_per_stage: Optional[int] = No
     
     all_stage_histories = []
     prev_fmma_layers = set()
-    
+    _resume_stage_idx = 0
+
+    # ------------------------------------------------------------------
+    # Resume progressive training from checkpoint
+    # ------------------------------------------------------------------
+    if config._resume_from is not None:
+        resume_path = Path(config._resume_from)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Progressive checkpoint not found: {resume_path}")
+
+        print(f"\nResuming progressive training from: {resume_path}")
+        prog_state = torch.load(resume_path, map_location="cpu")
+        _resume_stage_idx = prog_state["stage_idx"]
+        prev_fmma_layers = set(prog_state["prev_fmma_layers"])
+        all_stage_histories = prog_state.get("stage_histories", [])
+
+        # Restore student weights
+        student_state = prog_state["student_state_dict"]
+        # We need to first replace all previously-trained layers with FMMA
+        # so load_state_dict matches
+        if prev_fmma_layers:
+            student = replace_attention_with_fmma(
+                student,
+                num_channels=config.num_channels,
+                bandwidth=config.bandwidth,
+                layers_to_replace=sorted(prev_fmma_layers),
+            )
+        missing, unexpected = student.load_state_dict(student_state, strict=False)
+        if missing:
+            print(f"  Warning: {len(missing)} missing keys")
+        del prog_state, student_state
+        student = student.to(config.device)
+        print(f"  Resuming from stage {_resume_stage_idx}/{len(schedule)} "
+              f"(prev FMMA layers: {sorted(prev_fmma_layers)})")
+
     for stage_idx, (stage_name, stage_layers) in enumerate(schedule):
+        # Skip already-completed stages when resuming
+        if stage_idx < _resume_stage_idx:
+            print(f"\n  Skipping completed stage {stage_idx + 1}/{len(schedule)}: {stage_name}")
+            prev_fmma_layers = prev_fmma_layers | set(stage_layers)
+            continue
         print("\n" + "=" * 60)
         print(f"STAGE {stage_idx + 1}/{len(schedule)}: {stage_name}")
         print(f"  Layers: {stage_layers}")
@@ -1284,7 +1431,6 @@ def progressive_train(config: DistillConfig, steps_per_stage: Optional[int] = No
         prev_fmma_layers = prev_fmma_layers | set(stage_layers)
         
         # Stage-specific config
-        import copy
         stage_config = copy.copy(config)
         stage_config.layers_to_replace = stage_layers
         stage_config.max_steps = steps_per_stage
@@ -1314,17 +1460,30 @@ def progressive_train(config: DistillConfig, steps_per_stage: Optional[int] = No
         )
         student = history["_objects"]["student"]
         
+        # Strip live objects before appending — they can't be pickled
+        # (gradient checkpointing hooks are local functions).
+        serializable_history = {k: v for k, v in history.items() if k != "_objects"}
         all_stage_histories.append({
             "stage": stage_name,
             "layers": stage_layers,
-            "history": history,
+            "history": serializable_history,
         })
         
         if history.get("eval_history"):
             init_kl = history["eval_history"][0]["kl_loss"]
             fin_kl = history["final_metrics"]["kl_loss"]
             print(f"\n  Stage {stage_name}: KL {init_kl:.4f} → {fin_kl:.4f}")
-    
+
+        # Save progressive checkpoint (enables --resume for progressive runs)
+        prog_ckpt_path = Path(config.output_dir) / "progressive_checkpoint.pt"
+        torch.save({
+            "stage_idx": stage_idx + 1,  # next stage to run
+            "prev_fmma_layers": sorted(prev_fmma_layers),
+            "student_state_dict": student.state_dict(),
+            "stage_histories": all_stage_histories,
+        }, prog_ckpt_path)
+        print(f"  Saved progressive checkpoint to {prog_ckpt_path}")
+
     # Save the fully-trained model
     final_path = Path(config.output_dir) / "final_model"
     final_path.mkdir(parents=True, exist_ok=True)
@@ -1399,6 +1558,10 @@ if __name__ == "__main__":
     parser.add_argument("--warmup-steps", type=int, default=100, help="LR warmup steps")
     parser.add_argument("--grad-accum", type=int, default=4, help="Gradient accumulation steps")
     parser.add_argument("--log-every", type=int, default=10, help="Log metrics every N steps")
+    # Resume from checkpoint
+    parser.add_argument("--resume", type=str, nargs="?", const="latest", default=None,
+                        help="Resume from checkpoint. Pass a path to a specific checkpoint, "
+                             "or just --resume to auto-detect the latest in --output dir.")
     
     args = parser.parse_args()
     
@@ -1454,6 +1617,21 @@ if __name__ == "__main__":
     print(f"Temperature: {config.temperature}")
     print("="*60)
     
+    # ------------------------------------------------------------------
+    # Resume handling: resolve "latest" to actual checkpoint path
+    # ------------------------------------------------------------------
+    if args.resume is not None:
+        if args.resume == "latest":
+            resolved = find_latest_checkpoint(config.output_dir, progressive=args.progressive)
+            if resolved is None:
+                print(f"No checkpoint found in {config.output_dir} — starting from scratch.")
+            else:
+                config._resume_from = resolved
+                print(f"Resolved --resume=latest → {resolved}")
+        else:
+            # User provided an explicit path
+            config._resume_from = args.resume
+
     if args.progressive:
         # Progressive distillation: automatically stages through layer groups
         all_histories = progressive_train(config, steps_per_stage=args.steps_per_stage)

@@ -246,7 +246,14 @@ class FMMAAttention(nn.Module):
 
             mask_t = None
             if attention_mask is not None:
-                mask_t = attention_mask[:, t : t + 1]  # [B, 1]
+                if attention_mask.shape[1] == seq_len:
+                    # Prefill: mask is aligned with current tokens
+                    mask_t = attention_mask[:, t : t + 1]  # [B, 1]
+                else:
+                    # Decode: attention_mask is [B, T_kv] (all key positions),
+                    # but we need the mask for the NEW token being added.
+                    # Generated tokens are always valid (never padding).
+                    mask_t = attention_mask.new_ones(batch_size, 1)
 
             cache.update_moments(
                 layer_idx=self.layer_idx,
