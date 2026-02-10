@@ -840,31 +840,49 @@ def cocycle_attack_assessment():
   DISCUSSION — HYPOTHESES FOR FURTHER INVESTIGATION:
   ══════════════════════════════════════════════════════════════════
   
-  The following are theoretical observations, NOT measured results.
-  They suggest directions for future work but are not proven here.
+  The following were originally hypotheses. They have now been measured
+  in cwsa_next_steps.py. Key results:
   
-  A. COCYCLE-GUIDED BACKTRACKING (hypothesis, not measured)
-     The carry filtration could convert round inversion into a
-     bit-serial tree search. However, addition inversion is already
-     efficient — the hardness of SHA-256 lies in the global structure
-     (composition of rounds), not in inverting individual additions.
-     Measuring pruning rates would require empirical tree-search
-     experiments not performed here.
-  
-  B. SPECTRAL CARRY TRACKING (partially measured)
-     The carry spectrum is concentrated at low DFT frequencies
-     (Part 2 result). A CIMBA sketch could track dominant modes.
-     However, Part 6 shows that Σ functions destroy cross-round
-     carry coherence (correlations < 0.09), limiting the utility
-     of round-to-round spectral tracking.
-  
-  C. COHOMOLOGICAL CONSTRAINT COUNTING (hypothesis, not measured)
-     From SBGP: dim H^1 measures the obstruction to inversion.
-     The cocycle identity reduces the naive constraint count, so
-     H^1_CWSA < H^1_naive. Quantifying this reduction would require
-     computing H^1 explicitly, which is not done here.
+  A. FILTRATION COMPLEXITY PROFILE (measured — cwsa_next_steps.py Exp 1)
+     SHA-256 has rotation collisions at 12 of 32 filtration levels.
+     BOTH Σ₀ and Σ₁ have collisions — they're staggered so that at
+     every level, at least ONE of the two Σ functions has full diffusion.
      
-     How much smaller? That's an open question for future work.
+     Measured avalanche: at collision levels, the colliding Σ function
+     achieves only ~1 flipped bit (vs 3 at non-collision levels).
+     But the partner Σ function compensates.
+     
+     CRITICAL FINDING: No collision-free rotation triple exists in
+     [0..31]. The minimum achievable is 1 collision (at j=2, which is
+     unavoidable by pigeonhole). SHA-256's choice of staggering Σ₀/Σ₁
+     collisions is a DESIGN STRATEGY, not a flaw.
+  
+  B. REDUCED-ROUND CWSA DISTINGUISHER (measured — cwsa_next_steps.py Exp 2)
+     Carry spectral bias: UNDETECTABLE at all round counts (ratio ≈ 1.0).
+     Cross-round carry correlation: DETECTABLE (mean |corr| ≈ 0.14) at
+     ALL round counts from 2 to 64 — this does NOT decay with rounds.
+     
+     This means: consecutive rounds' carry bit patterns are correlated
+     at ~14%, regardless of round count. The Σ functions don't fully
+     destroy carry coherence at the BIT level (even though they destroy
+     it at the SPECTRAL level, as shown in Part 6).
+     
+     Low-bit prediction: ≈ random (no exploitable bias).
+  
+  C. CONSTRAINT RANK / H¹ PROXY (measured — cwsa_next_steps.py Exp 3)
+     Effective DOF ratio (effective rank / naive DOF):
+       1 round:  0.955  (10 redundant dimensions out of 224)
+       2 rounds: 0.962  (17 / 448)
+       4 rounds: 0.965  (31 / 896)
+       8 rounds: 0.966  (61 / 1792)
+      16 rounds: 0.632  (1318 / 3584) ← significant compression!
+     
+     The cocycle identity removes ~3.5% of DOF at low round counts,
+     but at 16 rounds the SVD rank drops to 63% — the carry space
+     is significantly overconstrained. This is the H¹ growth in action.
+     
+     Per-addition: K_t addition has rank 28/32 (lowest), because K_t
+     is constant → 4 carry bits are determined by the constant alone.
   
   ══════════════════════════════════════════════════════════════════
   WHAT CWSA DOES NOT ENABLE:
